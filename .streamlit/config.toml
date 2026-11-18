@@ -6,9 +6,18 @@ gatherUsageStats = false
 
 [theme]
 base = "light"
+baseRadius = "0.75rem"
+
+[theme.light]
 primaryColor = "#0F766E"
 backgroundColor = "#F7FAF9"
 secondaryBackgroundColor = "#ECF4F1"
 textColor = "#152C33"
 borderColor = "#D9E7E3"
-baseRadius = "0.75rem"
+
+[theme.dark]
+primaryColor = "#5EEAD4"
+backgroundColor = "#111923"
+secondaryBackgroundColor = "#1C2937"
+textColor = "#E7EFF7"
+borderColor = "#344658"

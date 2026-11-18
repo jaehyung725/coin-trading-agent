@@ -20,6 +20,7 @@ import pandas as pd
 import streamlit as st
 
 from market_grid import render_market_grid
+from theme_picker import render_theme_picker
 
 from agent import (Account, adjust_paper_cash,
                    initialize_account, manual_fill, paper_limit_orders, recent_candles)
@@ -206,8 +207,8 @@ def show_price_chart(candles, fills, settings, quote, boundary, now, count, indi
         orient="horizontal", size=5
     ).encode(y=alt.Y("종가:Q", title=quote, scale=price_scale), color=direction)
     overlays = [name for name in series if name not in ("RSI 14", "MACD", "시그널", "히스토그램")]
-    palette = {"밴드 상단": "#2563eb", "밴드 중심선": "#1e40af", "밴드 하단": "#2563eb",
-               "SMA 20": "#7e22ce", "EMA 20": "#0e7490", "매수": "#172554", "매도": "#9f1239"}
+    palette = {"밴드 상단": "#3975e8", "밴드 중심선": "#4f62dc", "밴드 하단": "#3975e8",
+               "SMA 20": "#9252d4", "EMA 20": "#10908e", "매수": "#2c70c1", "매도": "#c63e62"}
     dashes = {"밴드 상단": [7, 4], "밴드 중심선": [2, 4], "밴드 하단": [7, 4],
               "SMA 20": [1, 0], "EMA 20": [10, 3, 2, 3]}
     labels = [*overlays, "매수", "매도"]
@@ -265,7 +266,7 @@ def show_price_chart(candles, fills, settings, quote, boundary, now, count, indi
         guides = alt.Chart(alt.Data(values=[{"기준": 30}, {"기준": 70}])).mark_rule(
             color="#8b73a9", strokeDash=[5, 4]
         ).encode(y=alt.Y("기준:Q", title="RSI 14", scale=alt.Scale(domain=[0, 100])))
-        rsi = source.mark_line(color="#7e22ce", strokeWidth=2.7).encode(
+        rsi = source.mark_line(color="#9252d4", strokeWidth=2.7).encode(
             y=alt.Y("RSI 14:Q", scale=alt.Scale(domain=[0, 100])),
             tooltip=["한국 시간:N", alt.Tooltip("RSI 14:Q", format=".2f")]
         )
@@ -280,7 +281,7 @@ def show_price_chart(candles, fills, settings, quote, boundary, now, count, indi
             ["MACD", "시그널"], as_=["지표", "값"]
         ).mark_line(strokeWidth=2.7).encode(
             x=x, y=alt.Y("값:Q", title="MACD"),
-            color=alt.Color("지표:N", scale=alt.Scale(domain=["MACD", "시그널"], range=["#4338ca", "#b45309"])),
+            color=alt.Color("지표:N", scale=alt.Scale(domain=["MACD", "시그널"], range=["#6062de", "#cb741c"])),
             strokeDash=alt.StrokeDash("지표:N", legend=None,
                 scale=alt.Scale(domain=["MACD", "시그널"], range=[[1, 0], [6, 4]])),
             tooltip=["한국 시간:N", "지표:N", alt.Tooltip("값:Q", format=",.2f")],
@@ -289,9 +290,7 @@ def show_price_chart(candles, fills, settings, quote, boundary, now, count, indi
     chart = (
         alt.vconcat(*panels, spacing=12)
         .resolve_scale(x="shared")
-        .configure_view(stroke="#d9e3f3", fill="#f8faff")
-        .configure_axis(gridColor="#e0e8f5", labelColor="#334155", titleColor="#24365b")
-        .configure_legend(orient="top", labelColor="#24365b", symbolStrokeWidth=3)
+        .configure_legend(orient="top", symbolStrokeWidth=3)
     )
     st.altair_chart(chart, width="stretch")
     st.caption(f"최근 봉 {len(points)}개 · 진행 중인 봉은 5초마다 조회 · 삼각형은 모의 체결가")
@@ -847,8 +846,12 @@ def show_history(rows, path):
 
 if __name__ == "__main__":
     st.set_page_config(page_title="비트코인 모의매매 AI 에이전트", layout="wide")
-    st.title("비트코인 모의매매 AI 에이전트", anchor=False)
-    st.caption("공개 데모 · 방문자별 임시 가상계좌")
+    title, theme = st.columns([4, 1], vertical_alignment="center")
+    with title:
+        st.title("비트코인 모의매매 AI 에이전트", anchor=False)
+        st.caption("공개 데모 · 방문자별 임시 가상계좌")
+    with theme:
+        render_theme_picker(key="dashboard-theme")
     default_path = base_account_path()
     next_db = st.session_state.pop("next-paper-db", None)
     if next_db is not None:

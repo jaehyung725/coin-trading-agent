@@ -17,10 +17,10 @@ render_market_grid = st.components.v2.component(
     .viewport {
       overflow: auto;
       max-height: 31rem;
-      border: 1px solid #cbd9e2;
+      border: 1px solid light-dark(#cbd9e2, var(--st-border-color));
       border-radius: 0.65rem;
-      background: #fff;
-      color: #19323e;
+      background: light-dark(#fff, var(--st-secondary-background-color));
+      color: light-dark(#19323e, var(--st-text-color));
     }
     .header, .row {
       display: grid;
@@ -36,8 +36,8 @@ render_market_grid = st.components.v2.component(
       position: sticky;
       z-index: 1;
       top: 0;
-      background: #e9f2f6;
-      color: #345062;
+      background: light-dark(#e9f2f6, var(--st-background-color));
+      color: light-dark(#345062, var(--st-text-color));
       font-size: 10px;
       font-weight: 700;
       white-space: nowrap;
@@ -46,7 +46,7 @@ render_market_grid = st.components.v2.component(
       width: 100%;
       min-height: 43px;
       border: 0;
-      border-bottom: 1px solid #e8eef2;
+      border-bottom: 1px solid light-dark(#e8eef2, var(--st-border-color-light));
       border-left: 3px solid transparent;
       padding-left: 3px;
       background: transparent;
@@ -64,17 +64,17 @@ render_market_grid = st.components.v2.component(
       text-overflow: ellipsis;
       white-space: nowrap;
     }
-    small { color: #526979; font-size: 10px; }
+    small { color: light-dark(#526979, var(--st-gray-text-color)); font-size: 10px; }
     .row > :not(.identity) { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .row:hover { background: #f0f6fb; }
+    .row:hover { background: light-dark(#f0f6fb, var(--st-background-color)); }
     .row[aria-pressed="true"] {
-      background: #e4f0ff;
-      border-left-color: #1769c2;
+      background: light-dark(#e4f0ff, var(--st-blue-background-color));
+      border-left-color: light-dark(#1769c2, var(--st-blue-color));
     }
-    .row:focus-visible { outline: 2px solid #1769c2; outline-offset: -2px; }
-    .up { color: #125bb0; font-weight: 700; }
-    .down { color: #b42341; font-weight: 700; }
-    .turnover { color: #405768; }
+    .row:focus-visible { outline: 2px solid light-dark(#1769c2, var(--st-blue-color)); outline-offset: -2px; }
+    .up { color: light-dark(#125bb0, var(--st-blue-text-color)); font-weight: 700; }
+    .down { color: light-dark(#b42341, var(--st-red-text-color)); font-weight: 700; }
+    .turnover { color: light-dark(#405768, var(--st-text-color)); }
     """,
     js="""
     export default function ({ parentElement, data, setTriggerValue }) {
