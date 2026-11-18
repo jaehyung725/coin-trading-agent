@@ -14,6 +14,9 @@ from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
+from leveraged_paper import (attach_portfolio_accounts, merge_legacy_cash,
+                             read_portfolio_balances, record_cash_adjustment)
+
 
 @dataclass(frozen=True)
 class Candle:
@@ -178,13 +181,13 @@ def backtest(candles, args):
     print(json.dumps(account.summary(candles[-1].closing, args.cash)))
 
 
-def recent_candles(args, before, *, count=None):
+def recent_candles(args, before, *, count=None, seconds=False):
     if count is None:
         count = history_size(args) + 1
     query = urlencode(dict(market=args.market, count=count, to=before.isoformat()))
-    interval = {1440: "days", 10080: "weeks"}.get(args.minutes, f"minutes/{args.minutes}")
+    interval = "seconds" if seconds else {1440: "days", 10080: "weeks"}.get(args.minutes, f"minutes/{args.minutes}")
     url = f"https://api.upbit.com/v1/candles/{interval}?{query}"
-    with urlopen(url, timeout=10) as response:
+    with urlopen(url, timeout=2 if seconds else 10) as response:
         rows = json.load(response)
     return sorted(
         (Candle(datetime.fromisoformat(row["candle_date_time_utc"]).replace(tzinfo=timezone.utc),
@@ -326,20 +329,42 @@ def initialize_account(db, settings, cash):
                (json.dumps(settings, sort_keys=True), cash))
 
 
+def adjust_portfolio_cash(directory, active_path, target):
+    if not math.isfinite(target) or target < 0:
+        raise ValueError("가용 현금은 0 이상이어야 합니다.")
+
+    with closing(sqlite3.connect(f"{active_path.as_uri()}?mode=rw", uri=True)) as db, db:
+        schemas = attach_portfolio_accounts(db, directory, active_path)
+        db.execute("BEGIN IMMEDIATE")
+        balances = read_portfolio_balances(db, schemas)
+
+        difference = target - math.fsum(balances.values())
+        updated = balances.copy()
+        if difference >= 0:
+            updated["main"] += difference
+        else:
+            remaining = -difference
+            for schema, cash in balances.items():
+                withdrawal = min(max(cash, 0.0), remaining)
+                updated[schema] -= withdrawal
+                remaining -= withdrawal
+                if remaining <= 0:
+                    break
+
+        timestamp = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+        for schema, cash in balances.items():
+            record_cash_adjustment(db, schema, cash, updated[schema], timestamp)
+
+
 def adjust_paper_cash(path, target):
     if not math.isfinite(target) or target < 0:
         raise ValueError("가용 현금은 0 이상이어야 합니다.")
     with closing(sqlite3.connect(f"{path.as_uri()}?mode=rw", uri=True)) as db, db:
         db.execute("BEGIN IMMEDIATE")
+        merge_legacy_cash(db)
         cash, = db.execute("SELECT cash FROM account WHERE id=1").fetchone()
-        change = target - cash
-        if change == 0:
-            return
-        db.execute("""CREATE TABLE IF NOT EXISTS cash_adjustments (
-            time TEXT PRIMARY KEY, amount REAL NOT NULL)""")
         timestamp = datetime.now(timezone.utc).isoformat(timespec="microseconds")
-        db.execute("INSERT INTO cash_adjustments VALUES (?, ?)", (timestamp, change))
-        db.execute("UPDATE account SET cash=? WHERE id=1", (target,))
+        record_cash_adjustment(db, "main", cash, target, timestamp)
 
 
 def paper(args):
