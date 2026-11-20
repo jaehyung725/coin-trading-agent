@@ -8,7 +8,7 @@ import sqlite3
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from html import escape
-from tempfile import TemporaryDirectory, mkstemp
+from tempfile import mkstemp
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,6 +23,7 @@ from leveraged_paper import Long, merge_legacy_cash, paper_long
 from amount_input import amount_input
 from market_grid import render_market_grid
 from theme_picker import render_theme_picker
+from supabase_accounts import account_changes, account_directory, require_login, show_storage_error
 
 from agent import (Account, adjust_portfolio_cash,
                    initialize_account, manual_fill, paper_limit_orders, recent_candles)
@@ -643,15 +644,13 @@ def load_krw_tickers():
 
 
 def base_account_path():
-    if "demo-directory" not in st.session_state:
-        directory = TemporaryDirectory(prefix="bollinger-demo-")
-        path = Path(directory.name) / "paper.sqlite3"
+    path = account_directory() / "paper.sqlite3"
+    if not path.exists():
         settings = dict(market="KRW-BTC", minutes=15, period=20, deviations=2,
                         cash=1_000_000, allocation=0.1, fee=0.0005, slippage=0.0005)
         with closing(sqlite3.connect(path)) as db, db:
             initialize_account(db, settings, settings["cash"])
-        st.session_state["demo-directory"] = directory
-    return Path(st.session_state["demo-directory"].name) / "paper.sqlite3"
+    return path
 
 
 def market_account_path(market):
@@ -953,12 +952,17 @@ def show_portfolio(directory, path, account, settings, rows, adjustments, wallet
         equity.metric("평가자산", f"{total_equity:,.2f} KRW", border=True)
         performance.metric("현금 조정 제외 수익률", f"{return_pct:+.4f}%", border=True)
         open_profit.metric("보유 평가손익", f"{totals['unrealized']:+,.2f} KRW", border=True)
-    st.caption("세션 내 모든 모의계좌 합산 · 평가 시세는 원화 마켓 기준으로 최대 1분간 캐시됩니다.")
+    st.caption("내 모든 모의계좌 합산 · 평가 시세는 원화 마켓 기준으로 최대 1분간 캐시됩니다.")
     return totals["cash"] if not unavailable else None
 
 
 @st.fragment(run_every="1s")
-def show_account(path):
+def show_account(path, config):
+    with show_storage_error(), account_changes(config):
+        render_account(path)
+
+
+def render_account(path):
     if not path.is_file():
         st.info("계좌 파일이 없습니다. 모의매매 에이전트를 한 번 실행해 기본 계좌를 만드세요.")
         return
@@ -1173,14 +1177,7 @@ def show_history(rows):
         st.info("선택한 조건에 해당하는 체결이 없습니다.")
 
 
-if __name__ == "__main__":
-    st.set_page_config(page_title="비트코인 모의매매 AI 에이전트", layout="wide")
-    title, theme = st.columns([4, 1], vertical_alignment="center")
-    with title:
-        st.title("비트코인 모의매매 AI 에이전트", anchor=False)
-        st.caption("공개 데모 · 방문자별 임시 가상계좌")
-    with theme:
-        render_theme_picker(key="dashboard-theme")
+def select_account():
     default_path = base_account_path()
     if not st.session_state.get("unused-market-seeds-cleared"):
         try:
@@ -1206,6 +1203,23 @@ if __name__ == "__main__":
         except (sqlite3.Error, ValueError, TypeError) as error:
             st.session_state["market-error"] = f"모의계좌를 열 수 없습니다 · {error}"
     path = Path(st.session_state.get("paper-db", default_path))
+    if path.parent != default_path.parent or not path.is_file():
+        st.session_state.pop("paper-db", None)
+        return default_path
+    return path
+
+
+if __name__ == "__main__":
+    st.set_page_config(page_title="비트코인 모의매매 AI 에이전트", layout="wide")
+    title, theme = st.columns([4, 1], vertical_alignment="center")
+    with title:
+        st.title("비트코인 모의매매 AI 에이전트", anchor=False)
+        st.caption("로그인 계정별 가상계좌")
+    with theme:
+        render_theme_picker(key="dashboard-theme")
+    config = require_login()
+    with show_storage_error(), account_changes(config):
+        path = select_account()
     st.html("""
     <style>
     .st-key-market-workspace { max-width: 1380px; margin-inline: auto; }
@@ -1220,4 +1234,4 @@ if __name__ == "__main__":
         pass
     with st.sidebar:
         show_krw_market()
-    show_account(path)
+    show_account(path, config)
