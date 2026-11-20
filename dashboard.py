@@ -23,7 +23,10 @@ from leveraged_paper import Long, merge_legacy_cash, paper_long
 from amount_input import amount_input
 from market_grid import render_market_grid
 from theme_picker import render_theme_picker
-from supabase_accounts import account_changes, account_directory, require_login, show_storage_error
+from price_colors import NEGATIVE, NEUTRAL, POSITIVE, direction_color
+from supabase_accounts import (SupabaseError, account_changes, account_directory, current_login,
+                               load_config, login_dialog, navigate, show_account_controls,
+                               show_account_settings, show_auth_page, show_storage_error)
 
 from agent import (Account, adjust_portfolio_cash,
                    initialize_account, manual_fill, paper_limit_orders, recent_candles)
@@ -152,9 +155,29 @@ def session_execution_rows(directory, active_path, active_events):
     return [row for _, row in ordered], unavailable
 
 
+def signed_style(value):
+    color = direction_color(value) if pd.notna(value) else None
+    return f"color: {color}" if color else ""
+
+
+def signed_text(value, text):
+    color = direction_color(value)
+    return f'<span style="color:{color}">{escape(text)}</span>' if color else escape(text)
+
+
+def signed_metric(label, value, text, *, border=False):
+    if value is None:
+        st.metric(label, text, border=border)
+        return
+    with st.container(border=border):
+        st.caption(label)
+        st.markdown(f'<div style="font-size:1.75rem">{signed_text(value, text)}</div>', unsafe_allow_html=True)
+
+
 def show_trades(rows):
+    data = pd.DataFrame(rows).style.map(signed_style, subset=["실현 손익"])
     st.dataframe(
-        rows, hide_index=True,
+        data, hide_index=True,
         column_config={
             "체결가": st.column_config.NumberColumn(format="localized"),
             "수량": st.column_config.NumberColumn(format="%.8f"),
@@ -277,9 +300,11 @@ def show_price_chart(candles, fills, settings, quote, boundary, now, count, indi
             alt.Tooltip(f"{field}:Q", format=",.2f") for field in ("시가", "고가", "저가", "종가", "거래량")
         ]],
     )
-    direction = alt.condition(
-        alt.datum["종가"] >= alt.datum["시가"], alt.value("#cd425e"), alt.value("#0284c7")
-    )
+    direction = alt.condition(alt.datum["종가"] > alt.datum["시가"], alt.value(POSITIVE), alt.value(NEUTRAL))
+    direction["condition"] = [
+        direction["condition"],
+        {"test": "datum['종가'] < datum['시가']", "value": NEGATIVE},
+    ]
     wick = source.mark_rule().encode(
         y=alt.Y("저가:Q", title=quote, scale=price_scale), y2="고가:Q", color=direction
     )
@@ -356,7 +381,11 @@ def show_price_chart(candles, fills, settings, quote, boundary, now, count, indi
         panels.append((guides + rsi).properties(height=100))
     if "MACD" in indicators:
         histogram = source.mark_bar(size=5, opacity=0.45).encode(
-            color=alt.condition(alt.datum["히스토그램"] >= 0, alt.value("#168176"), alt.value("#cd425e")),
+            color={
+                "condition": [{"test": "datum['히스토그램'] > 0", "value": POSITIVE},
+                              {"test": "datum['히스토그램'] < 0", "value": NEGATIVE}],
+                "value": NEUTRAL,
+            },
             y=alt.Y("히스토그램:Q", title="MACD"),
             tooltip=["한국 시간:N", alt.Tooltip("히스토그램:Q", format=",.2f")],
         )
@@ -450,11 +479,13 @@ def show_performance(candles, fills, rows, settings, quote, adjustments):
     st.subheader("현물 모의매매 성과")
     profits = [row["실현 손익"] for row in rows if row["실현 손익"] is not None]
     completed = len(profits)
-    average = f"{sum(profits) / completed:+,.2f} {quote}" if completed else "—"
+    average = sum(profits) / completed if completed else None
     win_rate = f"{sum(profit > 0 for profit in profits) / completed:.1%}" if completed else "—"
     total, mean_profit, win = st.columns(3)
-    total.metric("누적 실현 손익", f"{sum(profits):+,.2f} {quote}")
-    mean_profit.metric("매도 체결당 평균 손익", average)
+    with total:
+        signed_metric("누적 실현 손익", sum(profits), f"{sum(profits):+,.2f} {quote}")
+    with mean_profit:
+        signed_metric("매도 체결당 평균 손익", average, f"{average:+,.2f} {quote}" if average is not None else "—")
     win.metric(f"승률 · 매도 {completed:,}건", win_rate)
 
     points, drawdown = performance_points(candles, fills, settings["cash"], settings["minutes"], adjustments,
@@ -499,7 +530,8 @@ def show_leverage_performance(market, events, totals, quote):
     wins = sum(row["실현 손익"] > 0 for _, row in closed)
     liquidations = sum(row["구분"] == "강제청산" for _, row in closed)
     profit, win_rate, exits = st.columns(3)
-    profit.metric("누적 실현 손익", f"{totals.realized_pnl:+,.2f} {quote}")
+    with profit:
+        signed_metric("누적 실현 손익", totals.realized_pnl, f"{totals.realized_pnl:+,.2f} {quote}")
     win_rate.metric("승률", f"{wins / completed:.1%}" if completed else "—")
     exits.metric("종료 포지션", f"{completed:,}건", help=f"강제청산 {liquidations:,}건")
     st.caption(f"롱 진입 {totals.entries:,}건 · 강제청산 {liquidations:,}건 · "
@@ -720,7 +752,7 @@ def show_krw_market():
         name = names.get(code, symbol)
         if query not in f"{name} {code}".casefold():
             continue
-        change = 100 * ticker["signed_change_rate"]
+        change = round(100 * ticker["signed_change_rate"], 2)
         turnover = ticker["acc_trade_price_24h"] / 1e8
         rows.append({
             "code": code,
@@ -785,7 +817,7 @@ def show_leverage_order(path, settings, wallet, mark, quote, portfolio_cash):
             st.metric("모의 청산가", f"{position.liquidation_price:,.2f} {quote}" if position.leverage > 1 else "—")
             if mark is not None:
                 pnl = position.release(mark) - position.margin - position.entry_fee
-                st.metric("예상 순손익", f"{pnl:+,.2f} {quote}", f"{pnl / position.margin:+.2%}")
+                signed_metric("예상 순손익", pnl, f"{pnl:+,.2f} {quote} ({pnl / position.margin:+.2%})")
             submit = st.button("모의 롱 종료", disabled=mark is None, key=f"{path}:long-close")
 
         if submit:
@@ -807,7 +839,9 @@ def show_leverage_order(path, settings, wallet, mark, quote, portfolio_cash):
         if history:
             with st.expander("레버리지 최근 종료 내역"):
                 for timestamp, leverage, entry, exit_price, pnl, status in history:
-                    st.caption(f"{local_time(timestamp):%m-%d %H:%M:%S} · {leverage}배 · {status} · {pnl:+,.2f} {quote}")
+                    amount = signed_text(pnl, f"{pnl:+,.2f} {quote}")
+                    st.caption(f"{local_time(timestamp):%m-%d %H:%M:%S} · {leverage}배 · {status} · {amount}",
+                               unsafe_allow_html=True)
                     st.caption(f"진입 {entry:,.2f} → 종료 {exit_price:,.2f} {quote}")
 
 
@@ -939,7 +973,9 @@ def show_portfolio(directory, path, account, settings, rows, adjustments, wallet
     cash.metric("가용 현금", "—" if unavailable else f"{totals['cash']:,.2f} KRW", border=True)
     count.metric("누적 체결", "—" if unavailable else f"{totals['trades']:,}건", border=True)
     fees.metric("누적 추정 수수료", "—" if unavailable else f"{totals['fees']:,.2f} KRW", border=True)
-    realized.metric("누적 실현 손익", "—" if unavailable else f"{totals['realized']:+,.2f} KRW", border=True)
+    with realized:
+        signed_metric("누적 실현 손익", None if unavailable else totals["realized"],
+                      "—" if unavailable else f"{totals['realized']:+,.2f} KRW", border=True)
     if status:
         equity.metric("평가자산", status, border=True)
         performance.metric("현금 조정 제외 수익률", status, border=True)
@@ -950,19 +986,33 @@ def show_portfolio(directory, path, account, settings, rows, adjustments, wallet
         total_equity = totals["cash"] + totals["position_value"]
         return_pct = 100 * ((total_equity - totals["funding"]) / totals["initial"] - 1)
         equity.metric("평가자산", f"{total_equity:,.2f} KRW", border=True)
-        performance.metric("현금 조정 제외 수익률", f"{return_pct:+.4f}%", border=True)
-        open_profit.metric("보유 평가손익", f"{totals['unrealized']:+,.2f} KRW", border=True)
+        with performance:
+            signed_metric("현금 조정 제외 수익률", return_pct, f"{return_pct:+.4f}%", border=True)
+        with open_profit:
+            signed_metric("보유 평가손익", totals["unrealized"], f"{totals['unrealized']:+,.2f} KRW", border=True)
     st.caption("내 모든 모의계좌 합산 · 평가 시세는 원화 마켓 기준으로 최대 1분간 캐시됩니다.")
     return totals["cash"] if not unavailable else None
 
 
 @st.fragment(run_every="1s")
-def show_account(path, config):
-    with show_storage_error(), account_changes(config):
-        render_account(path)
+def show_account(path, config, *, guest):
+    if guest:
+        render_account(path, guest=True)
+    else:
+        with show_storage_error(), account_changes(config):
+            render_account(path, guest=False)
 
 
-def render_account(path):
+def show_guest_actions():
+    with st.container(border=True):
+        st.subheader("모의 주문")
+        for label in ("현물 매수", "현물 매도", "레버리지 롱 진입", "가용 현금 및 계좌 관리"):
+            if st.button(label, width="stretch"):
+                st.session_state["show-login-dialog"] = True
+                st.rerun(scope="app")
+
+
+def render_account(path, *, guest):
     if not path.is_file():
         st.info("계좌 파일이 없습니다. 모의매매 에이전트를 한 번 실행해 기본 계좌를 만드세요.")
         return
@@ -1019,13 +1069,14 @@ def render_account(path):
     wallet = None
     mark = None
     try:
-        wallet = paper_long(path)
-        if (wallet[1] is not None or st.session_state.get(f"{path}:trade-mode") == "레버리지 롱"
+        if not guest:
+            wallet = paper_long(path)
+        if ((wallet is not None and wallet[1] is not None) or st.session_state.get(f"{path}:trade-mode") == "레버리지 롱"
                 or st.session_state.get(f"{path}:chart-interval") == 0):
             second_candles = load_second_candles(market, second_boundary)
             if second_candles and timedelta(0) <= datetime.now(timezone.utc) - second_candles[-1].start < timedelta(seconds=10):
                 mark = second_candles[-1].closing
-            if wallet[1] is not None and mark is not None and mark <= wallet[1].liquidation_price:
+            if wallet is not None and wallet[1] is not None and mark is not None and mark <= wallet[1].liquidation_price:
                 wallet = paper_long(path, mark=mark)
                 if wallet[3]:
                     st.warning("레버리지 롱이 모의 강제청산됐습니다.")
@@ -1035,40 +1086,42 @@ def render_account(path):
         wallet = None
         st.warning("레버리지 모의계좌를 불러올 수 없습니다.")
 
-    if wallet is not None:
-        account = dict(account, cash=wallet[0])
-    try:
-        orders = paper_limit_orders(path, market_price=live.closing if live else None)
-        current, _, adjustments = read_account(path)
-        if current["trades"] != account["trades"]:
-            st.rerun(scope="app")
-        account = dict(current)
+    if not guest:
         if wallet is not None:
-            wallet = (account["cash"], *wallet[1:])
-    except sqlite3.Error as error:
-        orders = []
-        st.warning(f"지정가 주문을 확인할 수 없습니다 · {error}")
-    net_funding = sum(event["amount"] for event in adjustments)
-    if account["cash"] < 0:
-        st.warning("기존 롱 포지션과 손익을 반영한 가용 현금이 음수입니다. 가용 현금을 충전하세요.")
+            account = dict(account, cash=wallet[0])
+        try:
+            orders = paper_limit_orders(path, market_price=live.closing if live else None)
+            current, _, adjustments = read_account(path)
+            if current["trades"] != account["trades"]:
+                st.rerun(scope="app")
+            account = dict(current)
+            if wallet is not None:
+                wallet = (account["cash"], *wallet[1:])
+        except sqlite3.Error as error:
+            orders = []
+            st.warning(f"지정가 주문을 확인할 수 없습니다 · {error}")
+        net_funding = sum(event["amount"] for event in adjustments)
+        if account["cash"] < 0:
+            st.warning("기존 롱 포지션과 손익을 반영한 가용 현금이 음수입니다. 가용 현금을 충전하세요.")
 
-    portfolio_cash = show_portfolio(base_account_path().parent, path, account, settings, rows, adjustments, wallet)
-    average_price = f"{average:,.2f} {quote}" if average is not None else "—"
-    st.caption(f"{market} 선택 계좌 · 가용 현금 {account['cash']:,.2f} {quote} · "
-               f"현물 {account['units']:,.8f} {asset} · 평균 매입가 {average_price}")
+        portfolio_cash = show_portfolio(base_account_path().parent, path, account, settings, rows, adjustments, wallet)
+        average_price = f"{average:,.2f} {quote}" if average is not None else "—"
+        st.caption(f"{market} 선택 계좌 · 가용 현금 {account['cash']:,.2f} {quote} · "
+                   f"현물 {account['units']:,.8f} {asset} · 평균 매입가 {average_price}")
 
-    if account["units"] > 0:
-        with st.expander("청산 가격별 예상 손익"):
-            exit_factor = (1 - args.slippage) * (1 - args.fee)
-            break_even = cost / (account["units"] * exit_factor)
-            st.caption(f"비용 포함 손익분기 시세 약 {break_even:,.2f} {quote}")
-            target = st.number_input(f"가정하는 청산 시세 ({quote})", min_value=0.0,
-                                     value=None, key=f"{path}:exit-price")
-            if target:
-                proceeds = target * account["units"] * exit_factor
-                proceeds_col, pnl_col = st.columns(2)
-                proceeds_col.metric("전량 청산 예상 수령액", f"{proceeds:,.2f} {quote}")
-                pnl_col.metric("예상 순손익", f"{proceeds - cost:+,.2f} {quote}")
+        if account["units"] > 0:
+            with st.expander("청산 가격별 예상 손익"):
+                exit_factor = (1 - args.slippage) * (1 - args.fee)
+                break_even = cost / (account["units"] * exit_factor)
+                st.caption(f"비용 포함 손익분기 시세 약 {break_even:,.2f} {quote}")
+                target = st.number_input(f"가정하는 청산 시세 ({quote})", min_value=0.0,
+                                         value=None, key=f"{path}:exit-price")
+                if target:
+                    proceeds = target * account["units"] * exit_factor
+                    proceeds_col, pnl_col = st.columns(2)
+                    proceeds_col.metric("전량 청산 예상 수령액", f"{proceeds:,.2f} {quote}")
+                    with pnl_col:
+                        signed_metric("예상 순손익", proceeds - cost, f"{proceeds - cost:+,.2f} {quote}")
 
     with st.container(key="market-workspace"):
         chart_panel, order_panel = st.columns([3, 1], gap="medium")
@@ -1103,6 +1156,12 @@ def render_account(path):
         base, symbol = market.split("-", maxsplit=1)
         st.link_button("업비트 원본 차트 열기", f"https://upbit.com/exchange?code=CRIX.UPBIT.{base}-{symbol}")
 
+    if guest:
+        with order_panel:
+            show_guest_actions()
+        show_strategy(settings, quote)
+        return
+
     with order_panel:
         show_order_and_account(path, account, settings, args, live, quote, asset, orders, wallet, mark, portfolio_cash)
 
@@ -1122,11 +1181,14 @@ def render_account(path):
         show_strategy(settings, quote)
 
     if adjustments:
-        with st.expander(f"가용 현금 변경 내역 · 순조정 {net_funding:+,.2f} {quote}"):
-            st.dataframe([{
+        with st.expander("가용 현금 변경 내역"):
+            st.caption("순조정 " + signed_text(net_funding, f"{net_funding:+,.2f} {quote}"), unsafe_allow_html=True)
+            amount = f"변경액 ({quote})"
+            history = pd.DataFrame([{
                 "변경 시각 (KST)": local_time(event["time"]).strftime("%Y-%m-%d %H:%M:%S"),
-                f"변경액 ({quote})": event["amount"],
-            } for event in reversed(adjustments)], hide_index=True)
+                amount: event["amount"],
+            } for event in reversed(adjustments)])
+            st.dataframe(history.style.map(signed_style, subset=[amount]), hide_index=True)
 
     st.subheader("체결 내역")
     executions, unavailable = session_execution_rows(base_account_path().parent, path, active_events)
@@ -1217,9 +1279,32 @@ if __name__ == "__main__":
         st.caption("로그인 계정별 가상계좌")
     with theme:
         render_theme_picker(key="dashboard-theme")
-    config = require_login()
-    with show_storage_error(), account_changes(config):
+    config = load_config()
+    login = None
+    if config is not None:
+        try:
+            login = current_login(config)
+        except SupabaseError:
+            st.error("로그인 서버에 연결하지 못했습니다. 잠시 후 새로고침해 주세요.")
+            st.stop()
+    notice = st.session_state.pop("auth-notice", None)
+    if notice:
+        st.success(notice)
+    page = st.session_state.get("auth-page", "market")
+    if login is None:
+        if page in ("login", "signup", "recover"):
+            show_auth_page(config, page)
+            st.stop()
+        if st.sidebar.button("로그인 / 회원가입"):
+            navigate("login")
         path = select_account()
+    else:
+        show_account_controls(config, login)
+        if page == "account" or login["must_change_password"]:
+            show_account_settings(config, login)
+            st.stop()
+        with show_storage_error(), account_changes(config):
+            path = select_account()
     st.html("""
     <style>
     .st-key-market-workspace { max-width: 1380px; margin-inline: auto; }
@@ -1234,4 +1319,6 @@ if __name__ == "__main__":
         pass
     with st.sidebar:
         show_krw_market()
-    show_account(path, config)
+    show_account(path, config, guest=login is None)
+    if login is None and st.session_state.pop("show-login-dialog", False):
+        login_dialog()

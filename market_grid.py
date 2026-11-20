@@ -2,6 +2,8 @@
 
 import streamlit as st
 
+from price_colors import NEGATIVE, POSITIVE
+
 
 render_market_grid = st.components.v2.component(
     "krw_market_grid",
@@ -72,10 +74,10 @@ render_market_grid = st.components.v2.component(
       border-left-color: light-dark(#1769c2, var(--st-blue-color));
     }
     .row:focus-visible { outline: 2px solid light-dark(#1769c2, var(--st-blue-color)); outline-offset: -2px; }
-    .up { color: light-dark(#125bb0, var(--st-blue-text-color)); font-weight: 700; }
-    .down { color: light-dark(#b42341, var(--st-red-text-color)); font-weight: 700; }
+    .up { color: POSITIVE_COLOR; font-weight: 700; }
+    .down { color: NEGATIVE_COLOR; font-weight: 700; }
     .turnover { color: light-dark(#405768, var(--st-text-color)); }
-    """,
+    """.replace("POSITIVE_COLOR", POSITIVE).replace("NEGATIVE_COLOR", NEGATIVE),
     js="""
     export default function ({ parentElement, data, setTriggerValue }) {
         const list = parentElement.querySelector(".rows");
