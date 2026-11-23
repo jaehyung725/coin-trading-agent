@@ -9,7 +9,9 @@ import re
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from secrets import token_urlsafe
 from tempfile import TemporaryDirectory
+from threading import Lock
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
@@ -17,11 +19,35 @@ from uuid import UUID
 from zipfile import BadZipFile, ZIP_DEFLATED, ZipFile
 
 import streamlit as st
+from operation_logs import operation_logger
 from streamlit.errors import StreamlitSecretNotFoundError
 from streamlit.runtime.scriptrunner import RerunException
 
 
 ADMIN_EMAIL = "admin@coin-trading-agent.invalid"
+LOGIN_SESSION_SECONDS = 12 * 60 * 60
+_browser_logins = {}
+_browser_logins_lock = Lock()
+
+_browser_session = st.components.v2.component(
+    "coin_login_session",
+    js="""
+    export default function ({ data, setStateValue }) {
+        const key = "coin-trading-agent:login:" + location.pathname;
+        try {
+            if (data.action === "read") {
+                setStateValue("handle", sessionStorage.getItem(key) || "");
+            } else if (data.handle) {
+                sessionStorage.setItem(key, data.handle);
+            } else {
+                sessionStorage.removeItem(key);
+            }
+        } catch {
+            // Login in the current Streamlit session works if storage is blocked.
+        }
+    }
+    """,
+)
 
 
 class SupabaseError(Exception):
@@ -60,10 +86,15 @@ def request(config, path, *, method="GET", data=None, token=None, private=False,
 
 
 def clear_session():
+    handle = st.session_state.get("browser-login")
+    if handle:
+        with _browser_logins_lock:
+            _browser_logins.pop(handle, None)
     directory = st.session_state.pop("account-directory", None)
     if directory is not None:
         directory.cleanup()
     st.session_state.clear()
+    st.session_state["browser-login"] = ""
 
 
 def save_login(payload):
@@ -81,22 +112,59 @@ def save_login(payload):
     }
 
 
+def remember_login(config):
+    now = time.monotonic()
+    handle = token_urlsafe(32)
+    with _browser_logins_lock:
+        for expired in [key for key, (_, expires, _) in _browser_logins.items() if expires <= now]:
+            del _browser_logins[expired]
+        _browser_logins[handle] = (config["url"], now + LOGIN_SESSION_SECONDS, st.session_state["login"])
+    st.session_state["browser-login"] = handle
+
+
+def restore_browser_login():
+    if "browser-login" in st.session_state:
+        data = {"action": "write", "handle": st.session_state["browser-login"]}
+    else:
+        data = {"action": "read"}
+    result = _browser_session(data=data, key="coin-login-session", default={"handle": None},
+                              on_handle_change=lambda: None)
+    if data["action"] == "read" and result.handle is not None:
+        handle = result.handle
+        st.session_state["browser-login"] = (
+            handle if isinstance(handle, str) and re.fullmatch(r"[A-Za-z0-9_-]{43}", handle) else ""
+        )
+
+
 def current_login(config):
-    login = st.session_state.get("login")
-    if login is not None and time.monotonic() >= login["expires"] - 60:
-        try:
-            payload = request(config, "/auth/v1/token?grant_type=refresh_token", method="POST",
-                              data={"refresh_token": login["refresh_token"]})
-            if str(UUID(payload["user"]["id"])) != login["user_id"]:
-                clear_session()
-                return None
-            save_login(payload)
-        except SupabaseError as error:
-            if error.status not in (400, 401, 403, 422):
-                raise
-            clear_session()
-        login = st.session_state.get("login")
-    return login
+    handle = st.session_state.get("browser-login")
+    if not handle:
+        return st.session_state.get("login")
+    # Supabase rotates refresh tokens. Serialize access so overlapping runs
+    # always use the latest token for this browser session.
+    with _browser_logins_lock:
+        saved = _browser_logins.get(handle)
+        if saved is not None:
+            url, expires, login = saved
+            if url == config["url"] and expires > time.monotonic():
+                if time.monotonic() >= login["expires"] - 60:
+                    try:
+                        payload = request(config, "/auth/v1/token?grant_type=refresh_token", method="POST",
+                                          data={"refresh_token": login["refresh_token"]})
+                        if str(UUID(payload["user"]["id"])) != login["user_id"]:
+                            raise SupabaseError(403)
+                        save_login(payload)
+                        login = st.session_state["login"]
+                        _browser_logins[handle] = (url, expires, login)
+                    except SupabaseError as error:
+                        if error.status not in (400, 401, 403, 422):
+                            raise
+                        login = None
+                if login is not None:
+                    st.session_state["login"] = login
+                    return login
+    clear_session()
+    return None
 
 
 def load_config():
@@ -126,18 +194,6 @@ def navigate(page):
     st.rerun(scope="app")
 
 
-@st.dialog("로그인이 필요합니다", width="small")
-def login_dialog():
-    st.write("모의 매매를 시작하시려면 로그인이 필요합니다")
-    login, signup = st.columns(2)
-    login.button("로그인", type="primary", width="stretch", on_click=st.session_state.__setitem__,
-                 args=("auth-page", "login"))
-    signup.button("회원가입", width="stretch", on_click=st.session_state.__setitem__,
-                  args=("auth-page", "signup"))
-    if st.session_state.get("auth-page") in ("login", "signup"):
-        st.rerun(scope="app")
-
-
 def show_auth_error(error, *, signup=False):
     if signup and error.code == "email_address_not_authorized":
         st.error("이 주소로 가입 확인 메일을 보낼 수 없습니다. 앱 관리자에게 문의해 주세요.")
@@ -159,14 +215,16 @@ def password_login(config, email, password):
 
 
 def show_auth_page(config, page):
-    with st.container(horizontal_alignment="center"), st.container(width=420):
+    with st.container(horizontal_alignment="center"), st.container(width=420, border=True):
         st.subheader({"login": "로그인", "signup": "회원가입", "recover": "비밀번호 찾기"}[page])
         if config is None:
-            st.error("Supabase 연결 설정이 필요합니다. Streamlit Secrets의 프로젝트 URL과 API 키를 확인해 주세요.")
+            st.error("현재 로그인 서비스를 사용할 수 없습니다. 잠시 후 다시 시도해 주세요.")
         elif page == "recover":
             show_recovery(config)
         else:
             signup = page == "signup"
+            if signup:
+                st.caption("가입 후 이메일로 받은 확인 링크를 열어 주세요.")
             with st.form(f"auth-{page}", clear_on_submit=True):
                 email = st.text_input("이메일" if signup else "이메일 또는 관리자 아이디")
                 password = st.text_input("비밀번호", type="password")
@@ -189,10 +247,15 @@ def show_auth_page(config, page):
                         if payload.get("access_token"):
                             clear_session()
                             save_login(payload)
+                            remember_login(config)
                             st.session_state["auth-notice"] = (
                                 "회원가입이 완료되었습니다." if signup else "로그인되었습니다.")
                             navigate("market")
-                        st.success("회원가입 요청이 완료되었습니다. 이메일의 확인 링크를 누른 뒤 로그인해 주세요.")
+                        if signup:
+                            st.success("회원가입이 완료되었습니다.")
+                            st.info("이메일의 확인 링크를 누른 뒤 로그인해 주세요.")
+                        else:
+                            show_auth_error(SupabaseError())
                     except SupabaseError as error:
                         show_auth_error(error, signup=signup)
             if signup and st.button("로그인 화면으로"):
@@ -264,8 +327,14 @@ def show_recovery(config):
 
 
 def show_account_controls(config, login):
-    st.sidebar.text("관리자" if login["role"] == "admin" else login["email"])
-    if st.sidebar.button("로그아웃"):
+    st.caption(login["email"])
+    page = st.session_state.get("auth-page", "market")
+    if page != "account" and not login["must_change_password"] and st.button("내 계정", width="stretch"):
+        navigate("account")
+    if (page != "members" and login["role"] == "admin" and not login["must_change_password"]
+            and st.button("회원 관리", width="stretch")):
+        navigate("members")
+    if st.button("로그아웃", width="stretch"):
         try:
             request(config, "/auth/v1/logout?scope=local", method="POST", token=login["access_token"])
             message = "로그아웃되었습니다."
@@ -274,8 +343,85 @@ def show_account_controls(config, login):
         clear_session()
         st.session_state["auth-notice"] = message
         navigate("market")
-    if st.sidebar.button("내 계정"):
-        navigate("account")
+
+
+MEMBER_PAGE_SIZE = 50
+
+
+def require_member_admin(config, login):
+    if login["role"] != "admin" or login["must_change_password"]:
+        raise SupabaseError(403)
+    user = request(config, "/auth/v1/user", token=login["access_token"])
+    metadata = user.get("app_metadata") or {}
+    if (user.get("id") != login["user_id"] or metadata.get("coin_role") != "admin"
+            or metadata.get("must_change_password") is True):
+        raise SupabaseError(403)
+
+
+def is_deletable_member(user, admin_id):
+    metadata = user.get("app_metadata") or {}
+    email = user.get("email") or ""
+    return (user["id"] != admin_id and bool(email) and email.casefold() != ADMIN_EMAIL
+            and metadata.get("coin_role") in (None, "user"))
+
+
+def delete_member(config, login, member_id, confirmed_email):
+    require_member_admin(config, login)
+    target_id = str(UUID(member_id))
+    endpoint = f"/auth/v1/admin/users/{target_id}"
+    target = request(config, endpoint, private=True)
+    if target["id"] != target_id or not is_deletable_member(target, login["user_id"]):
+        raise SupabaseError(403)
+    if confirmed_email.strip() != target["email"]:
+        raise ValueError("삭제할 회원의 이메일을 정확히 입력해 주세요.")
+    request(config, endpoint, method="DELETE", private=True, data={"should_soft_delete": False})
+
+
+def show_member_management(config, login):
+    st.subheader("회원 관리")
+    page = st.session_state.get("member-page", 1)
+    try:
+        require_member_admin(config, login)
+        query = urlencode({"page": page, "per_page": MEMBER_PAGE_SIZE})
+        users = request(config, "/auth/v1/admin/users?" + query, private=True)["users"]
+    except SupabaseError as error:
+        st.error("회원 관리 권한이 필요합니다." if error.status in (401, 403)
+                 else "회원 목록을 불러오지 못했습니다.")
+        return
+    members = [user for user in users if is_deletable_member(user, login["user_id"])]
+    previous, following = st.columns(2)
+    if previous.button("이전 페이지", disabled=page == 1):
+        st.session_state["member-page"] = page - 1
+        st.rerun(scope="app")
+    if following.button("다음 페이지", disabled=len(users) < MEMBER_PAGE_SIZE):
+        st.session_state["member-page"] = page + 1
+        st.rerun(scope="app")
+    if not members:
+        st.info("이 페이지에 일반 회원이 없습니다.")
+        return
+    emails = {user["id"]: user["email"] for user in members}
+    member_id = st.selectbox("삭제할 일반 회원", tuple(emails), format_func=emails.__getitem__,
+                             index=None, placeholder="회원 이메일을 선택하세요.")
+    if member_id is None:
+        return
+    st.warning("삭제하면 이 회원의 계정과 모의계좌 잔고, 주문 및 거래 기록이 영구 삭제됩니다.")
+    with st.form(f"delete-member:{member_id}", clear_on_submit=True):
+        confirmed_email = st.text_input("삭제할 회원 이메일 확인", placeholder=emails[member_id])
+        submit = st.form_submit_button("일반 회원 삭제", type="primary")
+    if not submit:
+        return
+    try:
+        delete_member(config, login, member_id, confirmed_email)
+    except ValueError as error:
+        st.warning(str(error))
+    except SupabaseError as error:
+        if error.status in (401, 403, 404):
+            st.error("관리자 권한과 대상 계정의 현재 상태를 확인해 주세요.")
+        else:
+            st.error("회원을 삭제하지 못했습니다. 다시 시도해 주세요.")
+    else:
+        st.session_state["auth-notice"] = f"{emails[member_id]} 회원을 삭제했습니다."
+        navigate("members")
 
 
 def show_account_settings(config, login):
@@ -340,8 +486,6 @@ def show_account_settings(config, login):
                             navigate("market")
                         except SupabaseError:
                             st.error("탈퇴하지 못했습니다. 비밀번호를 확인하고 다시 시도해 주세요.")
-        if not login["must_change_password"] and st.button("모의매매 화면으로"):
-            navigate("market")
 
 
 def account_directory():
@@ -367,6 +511,29 @@ def unpack(snapshot):
         return {name: archive.read(name) for name in names}
 
 
+SNAPSHOT_ENDPOINT = "/rest/v1/paper_account_snapshots"
+
+
+def snapshot_rows(config, filters):
+    return request(config, SNAPSHOT_ENDPOINT + "?" + urlencode(filters), private=True)
+
+
+def publish_account_snapshot(config, user_id, revision, files):
+    snapshot = pack(files)
+    if revision is None:
+        rows = request(config, SNAPSHOT_ENDPOINT + "?on_conflict=user_id&select=revision", method="POST",
+                       data={"user_id": user_id, "snapshot": snapshot}, private=True,
+                       prefer="resolution=ignore-duplicates,return=representation")
+    else:
+        filters = urlencode({"user_id": f"eq.{user_id}", "revision": f"eq.{revision}", "select": "revision"})
+        rows = request(config, SNAPSHOT_ENDPOINT + "?" + filters, method="PATCH",
+                       data={"revision": revision + 1, "snapshot": snapshot}, private=True,
+                       prefer="return=representation")
+    if not rows:
+        raise SupabaseError(409)
+    return rows[0]["revision"]
+
+
 @contextmanager
 def account_changes(config):
     """Publish all changed account files together, rejecting concurrent writes."""
@@ -374,7 +541,6 @@ def account_changes(config):
     if login is None or login.get("must_change_password"):
         st.rerun(scope="app")
     directory = account_directory()
-    endpoint = "/rest/v1/paper_account_snapshots"
     account_filter = {"user_id": f"eq.{login['user_id']}"}
     select = {**account_filter, "select": "revision,snapshot"}
     cached = st.session_state.get("account-revision")
@@ -386,30 +552,17 @@ def account_changes(config):
         after = files()
         if before == after:
             return
-        snapshot = pack(after)
-        if revision is None:
-            rows = request(config, endpoint + "?on_conflict=user_id&select=revision", method="POST",
-                           data={"user_id": login["user_id"], "snapshot": snapshot}, private=True,
-                           prefer="resolution=ignore-duplicates,return=representation")
-        else:
-            filters = urlencode({**account_filter, "revision": f"eq.{revision}", "select": "revision"})
-            rows = request(config, endpoint + "?" + filters, method="PATCH",
-                           data={"revision": revision + 1, "snapshot": snapshot}, private=True,
-                           prefer="return=representation")
-        if not rows:
-            raise SupabaseError(409)
-        st.session_state["account-revision"] = rows[0]["revision"]
+        st.session_state["account-revision"] = publish_account_snapshot(config, login["user_id"], revision, after)
 
     if cached is not None:
-        revision_rows = request(config, endpoint + "?" + urlencode({**account_filter, "select": "revision"}),
-                                private=True)
+        revision_rows = snapshot_rows(config, {**account_filter, "select": "revision"})
         if not revision_rows:
             clear_session()
             st.rerun(scope="app")
     if cached is not None and revision_rows[0]["revision"] == cached:
         revision = cached
     else:
-        rows = request(config, endpoint + "?" + urlencode(select), private=True)
+        rows = snapshot_rows(config, select)
         if cached is not None and not rows:
             clear_session()
             st.rerun(scope="app")
@@ -440,6 +593,8 @@ def show_storage_error():
     try:
         yield
     except (SupabaseError, OSError, ValueError, BadZipFile) as error:
+        operation_logger("dashboard").warning("Account storage failure type=%s status=%s",
+                                              type(error).__name__, getattr(error, "status", None))
         st.session_state.pop("account-revision", None)
         for key in list(st.session_state):
             if key in ("next-paper-db", "next-market") or key.endswith(

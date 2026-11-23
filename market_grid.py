@@ -1,4 +1,4 @@
-"""Compact, selectable market table for the Streamlit sidebar."""
+"""Searchable market table with keyboard-accessible symbol selection."""
 
 import streamlit as st
 
@@ -18,7 +18,7 @@ render_market_grid = st.components.v2.component(
     css="""
     .viewport {
       overflow: auto;
-      max-height: 31rem;
+      max-height: min(31rem, 55vh);
       border: 1px solid light-dark(#cbd9e2, var(--st-border-color));
       border-radius: 0.65rem;
       background: light-dark(#fff, var(--st-secondary-background-color));
@@ -40,7 +40,7 @@ render_market_grid = st.components.v2.component(
       top: 0;
       background: light-dark(#e9f2f6, var(--st-background-color));
       color: light-dark(#345062, var(--st-text-color));
-      font-size: 10px;
+      font-size: 11px;
       font-weight: 700;
       white-space: nowrap;
     }
@@ -55,7 +55,7 @@ render_market_grid = st.components.v2.component(
       color: inherit;
       cursor: pointer;
       font: inherit;
-      font-size: 11px;
+      font-size: 12px;
       font-variant-numeric: tabular-nums;
     }
     .header > :first-child, .identity { text-align: left; }

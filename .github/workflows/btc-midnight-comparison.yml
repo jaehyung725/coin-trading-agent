@@ -1,0 +1,48 @@
+name: Bitcoin midnight comparison
+
+on:
+  workflow_dispatch:
+    inputs:
+      cutoff:
+        description: "Cutoff timestamp, including timezone offset"
+        required: true
+        type: string
+        default: "2026-11-24T00:00:00+09:00"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: btc-midnight-comparison
+  cancel-in-progress: false
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 225
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        segment: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements.txt
+      - name: Run automatic strategies and publish the comparison
+        env:
+          COIN_CLOUD_SECRETS_TOML: ${{ secrets.COIN_CLOUD_SECRETS_TOML }}
+          COIN_COMPARISON_CUTOFF: ${{ inputs.cutoff }}
+        run: |
+          if [ -z "$COIN_CLOUD_SECRETS_TOML" ]; then
+            echo "::error::Set COIN_CLOUD_SECRETS_TOML in repository Actions secrets."
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "$COIN_CLOUD_SECRETS_TOML" > .streamlit/secrets.toml
+          trap 'rm -f .streamlit/secrets.toml' EXIT
+          python auto_runner.py --cloud-until "$COIN_COMPARISON_CUTOFF" --max-run-minutes 210

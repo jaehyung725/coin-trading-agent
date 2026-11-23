@@ -5,12 +5,13 @@ import io
 import json
 import re
 import sqlite3
-from contextlib import closing
+from contextlib import closing, nullcontext
 from datetime import datetime, timedelta, timezone
 from html import escape
 from tempfile import mkstemp
 import os
 from pathlib import Path
+from time import monotonic
 from types import SimpleNamespace
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -19,21 +20,32 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from leveraged_paper import Long, merge_legacy_cash, paper_long
+from leveraged_paper import Position, manual_account_paths, merge_legacy_cash, paper_leverage
 from amount_input import amount_input
 from market_grid import render_market_grid
 from theme_picker import render_theme_picker
+from auto_runner import auto_enabled, set_auto_enabled, worker_online
+from llm_strategy import AUTO_STRATEGIES, LLM_STRATEGY, openai_settings
+from rapid_paper import activate_rapid_strategy, DEFAULT_LEVERAGE, LEGACY_ENTRY_PERCENT
+from strategies import ENTRY_PERCENTAGES, LEVERAGE_LEVELS, STRATEGIES, STRATEGY_VERSION, indicator_series
 from price_colors import NEGATIVE, NEUTRAL, POSITIVE, direction_color
+from auto_report import build_auto_report, interpret_report, report_markdown, report_metrics
+from cloud_comparison import read_cloud_comparison, schedule_cloud_comparison
+from operation_logs import operation_logger
+from scheduled_comparison import JOB_FILE, activation_times, collect_report
 from supabase_accounts import (SupabaseError, account_changes, account_directory, current_login,
-                               load_config, login_dialog, navigate, show_account_controls,
-                               show_account_settings, show_auth_page, show_storage_error)
+                               load_config, navigate, restore_browser_login, show_account_controls,
+                               show_account_settings, show_auth_page, show_member_management, show_storage_error)
 
 from agent import (Account, adjust_portfolio_cash,
-                   initialize_account, manual_fill, paper_limit_orders, recent_candles)
+                   initialize_account, manual_fill, paper_limit_orders, recent_candles, record_hourly_return, replay,
+                   save_auto_decision)
 
 KST = timezone(timedelta(hours=9))
+CHART_REFRESH_SECONDS = 15
 SIDE_LABELS = {"BUY": "매수", "SELL": "매도"}
-INDICATORS = ("볼린저 밴드", "SMA 20", "EMA 20", "RSI 14", "MACD")
+SOURCE_LABELS = {"manual": "수동", "auto": "자동"}
+INDICATORS = tuple(STRATEGIES.values())
 
 
 def local_time(timestamp):
@@ -51,6 +63,10 @@ def read_account(path):
         ).fetchone()
         adjustments = db.execute("SELECT * FROM cash_adjustments ORDER BY time").fetchall() if has_adjustments else []
     return account, fills, adjustments
+
+
+def trade_source(row, column="source"):
+    return SOURCE_LABELS.get(row[column] if column in row.keys() else None, "미분류")
 
 
 def trade_rows(fills, fee_rate):
@@ -72,6 +88,7 @@ def trade_rows(fills, fee_rate):
         rows.append({
             "체결 시각 (KST)": local_time(fill["time"]).strftime("%Y-%m-%d %H:%M:%S"),
             "구분": SIDE_LABELS[fill["side"]],
+            "출처": trade_source(fill),
             "체결가": fill["price"],
             "수량": quantity,
             "수수료": round(fee, 2),
@@ -83,7 +100,9 @@ def trade_rows(fills, fee_rate):
     return rows[::-1]
 
 
-LONG_TRADE_LABELS = ("롱 진입", "롱 종료", "강제청산")
+LEVERAGE_EXITS = ("롱 종료", "숏 종료", "강제청산", "숏 강제청산")
+LEVERAGE_TRADE_LABELS = ("롱 진입", "숏 진입", *LEVERAGE_EXITS)
+LEVERAGE_MODES = {"레버리지 롱": "long", "레버리지 숏": "short"}
 
 
 def spot_execution_events(market, fills, spot_rows):
@@ -103,13 +122,15 @@ def execution_events(path, market, fills, spot_rows):
         positions = db.execute("SELECT * FROM leverage_positions ORDER BY id").fetchall() if exists else []
 
     for item in positions:
-        position = Long(item["margin"], item["leverage"], item["entry"], item["fee"], item["slippage"])
         cash_columns = item.keys()
+        side = item["side"] if "side" in cash_columns else "long"
+        position = Position(item["margin"], item["leverage"], item["entry"], item["fee"], item["slippage"], side)
         opened = local_time(item["opened_at"])
         events.append((opened, {
             "종목": market,
             "체결 시각 (KST)": opened.strftime("%Y-%m-%d %H:%M:%S"),
-            "구분": "롱 진입",
+            "구분": f"{position.label} 진입",
+            "출처": trade_source(item),
             "체결가": position.entry,
             "수량": position.quantity,
             "수수료": round(position.entry_fee, 2),
@@ -120,11 +141,13 @@ def execution_events(path, market, fills, spot_rows):
         }))
         if item["closed_at"] is not None:
             closed = local_time(item["closed_at"])
-            exit_fee = position.quantity * item["exit"] * position.fee if item["status"] == "롱 종료" else 0.0
+            exit_fee = (position.quantity * item["exit"] * position.fee
+                        if item["status"] in ("롱 종료", "숏 종료") else 0.0)
             events.append((closed, {
                 "종목": market,
                 "체결 시각 (KST)": closed.strftime("%Y-%m-%d %H:%M:%S"),
                 "구분": item["status"],
+                "출처": trade_source(item, "exit_source"),
                 "체결가": item["exit"],
                 "수량": position.quantity,
                 "수수료": round(exit_fee, 2),
@@ -139,7 +162,7 @@ def execution_events(path, market, fills, spot_rows):
 def session_execution_rows(directory, active_path, active_events):
     events = list(active_events)
     unavailable = 0
-    for path in sorted(directory.glob("*.sqlite3")):
+    for path in manual_account_paths(directory):
         if path == active_path:
             continue
         try:
@@ -214,42 +237,7 @@ def load_second_candles(market, boundary):
                           count=200, seconds=True)
 
 
-def indicator_series(candles, indicators, settings):
-    closes = pd.Series([candle.closing for candle in candles], dtype=float)
-    series = {}
-    if "볼린저 밴드" in indicators:
-        window = closes.rolling(settings["period"])
-        center = window.mean()
-        spread = window.std(ddof=0) * settings["deviations"]
-        series.update({"밴드 상단": center + spread, "밴드 중심선": center, "밴드 하단": center - spread})
-    if "SMA 20" in indicators:
-        series["SMA 20"] = closes.rolling(20).mean()
-    if "EMA 20" in indicators:
-        series["EMA 20"] = closes.ewm(span=20, min_periods=20, adjust=False).mean()
-    if "RSI 14" in indicators:
-        changes = closes.diff().dropna()
-        if len(changes) >= 14:
-            gains, losses = changes.clip(lower=0), -changes.clip(upper=0)
-            avg_gain = pd.concat([pd.Series({14: gains.iloc[:14].mean()}), gains.iloc[14:]]).ewm(
-                alpha=1 / 14, adjust=False
-            ).mean()
-            avg_loss = pd.concat([pd.Series({14: losses.iloc[:14].mean()}), losses.iloc[14:]]).ewm(
-                alpha=1 / 14, adjust=False
-            ).mean()
-            series["RSI 14"] = (100 - 100 / (1 + avg_gain / avg_loss)).mask(
-                avg_gain.eq(0) & avg_loss.eq(0), 50
-            ).reindex(closes.index)
-    if "MACD" in indicators:
-        fast = closes.ewm(span=12, min_periods=12, adjust=False).mean()
-        slow = closes.ewm(span=26, min_periods=26, adjust=False).mean()
-        macd = fast - slow
-        signal = macd.ewm(span=9, min_periods=9, adjust=False).mean()
-        series.update({"MACD": macd, "시그널": signal, "히스토그램": macd - signal})
-    return series
-
-
-def show_price_chart(candles, fills, settings, quote, boundary, now, count, indicators, average, date_only=False, seconds=False):
-    market = settings["market"]
+def show_market_heading(market, latest, quote):
     try:
         name = load_krw_market_names().get(market)
     except (URLError, TimeoutError, ValueError, KeyError, TypeError):
@@ -257,8 +245,14 @@ def show_price_chart(candles, fills, settings, quote, boundary, now, count, indi
     if name is None and market == "KRW-BTC":
         name = "비트코인"
     st.subheader(f"{name} ({market})" if name else market)
+    if latest is not None:
+        price = f"{latest.closing:,.10f}".rstrip("0").rstrip(".")
+        st.markdown(f"**{price} {quote}** · 최근 조회 가격")
+
+
+def show_price_chart(candles, executions, settings, quote, boundary, now, count, indicators, average, date_only=False, seconds=False):
     if not candles:
-        st.info("확정 봉을 불러오면 가격과 체결 지점이 표시됩니다.")
+        st.info("이 시간 간격의 차트 데이터가 아직 없습니다. 다른 간격을 선택하거나 잠시 후 다시 확인해 주세요.")
         return
 
     time_format = "%Y-%m-%d %H:%M:%S" if seconds else "%Y-%m-%d %H:%M"
@@ -281,16 +275,11 @@ def show_price_chart(candles, fills, settings, quote, boundary, now, count, indi
                       if pd.notna(values.iloc[index])})
         points.append(point)
 
-    markers = []
-    for fill in fills:
-        time = datetime.fromisoformat(fill["time"])
-        if candles[first].start <= time <= now:
-            markers.append({
-                "시각": time.isoformat(),
-                "한국 시간": time.astimezone(KST).strftime(time_format),
-                "구분": SIDE_LABELS[fill["side"]],
-                "체결가": fill["price"],
-            })
+    markers = [
+        {"시각": timestamp.isoformat(), "한국 시간": timestamp.astimezone(KST).strftime(time_format),
+         "구분": row["구분"], "체결가": row["체결가"]}
+        for timestamp, row in executions if candles[first].start <= timestamp <= now
+    ]
 
     x = kst_axis("봉 시작 시각 (KST)", date_only, seconds)
     price_scale = alt.Scale(zero=False)
@@ -316,11 +305,15 @@ def show_price_chart(candles, fills, settings, quote, boundary, now, count, indi
     ).encode(y=alt.Y("종가:Q", title=quote, scale=price_scale), color=direction)
     overlays = [name for name in series if name not in ("RSI 14", "MACD", "시그널", "히스토그램")]
     palette = {"밴드 상단": "#3975e8", "밴드 중심선": "#4f62dc", "밴드 하단": "#3975e8",
-               "SMA 20": "#9252d4", "EMA 20": "#10908e", "매수": "#2c70c1", "매도": "#c63e62"}
+               "SMA 20": "#9252d4", "EMA 20": "#10908e", "매수": "#2c70c1", "매도": "#c63e62",
+               "롱 진입": "#2c70c1", "숏 진입": "#c63e62"}
     dashes = {"밴드 상단": [7, 4], "밴드 중심선": [2, 4], "밴드 하단": [7, 4],
               "SMA 20": [1, 0], "EMA 20": [10, 3, 2, 3]}
-    labels = [*overlays, "매수", "매도"]
-    colors = [palette[label] for label in labels]
+    trade_labels = list(dict.fromkeys(marker["구분"] for marker in markers))
+    labels = [*overlays, *trade_labels]
+    colors = [palette.get(label, "#80653d") for label in labels]
+    trade_shapes = {"매수": "triangle-up", "롱 진입": "triangle-up",
+                    "매도": "triangle-down", "숏 진입": "triangle-down"}
     color = alt.Color("항목:N", scale=alt.Scale(domain=labels, range=colors), title=None)
     lines = (
         alt.Chart(alt.Data(values=points))
@@ -338,17 +331,17 @@ def show_price_chart(candles, fills, settings, quote, boundary, now, count, indi
     trades = (
         alt.Chart(alt.Data(values=markers))
         .transform_calculate(항목="datum['구분']")
-        .mark_point(filled=True, size=155, opacity=1, stroke="white", strokeWidth=1.2)
+        .mark_point(filled=True, size=155, opacity=1, stroke="white", strokeWidth=1.2, clip=True)
         .encode(
             x=x,
             y=alt.Y("체결가:Q", title=quote, scale=price_scale),
             color=color,
             shape=alt.Shape(
                 "구분:N",
-                scale=alt.Scale(domain=["매수", "매도"], range=["triangle-up", "triangle-down"]),
+                scale=alt.Scale(domain=trade_labels, range=[trade_shapes.get(label, "diamond") for label in trade_labels]),
                 legend=None,
             ),
-            tooltip=["한국 시간:N", "구분:N", alt.Tooltip("체결가:Q", format=",.2f")],
+            tooltip=["한국 시간:N", "구분:N", alt.Tooltip("체결가:Q", format=",.8~f")],
         )
     )
     zoom = alt.selection_interval(bind="scales", encodings=["x"], name="chart_zoom")
@@ -365,7 +358,18 @@ def show_price_chart(candles, fills, settings, quote, boundary, now, count, indi
                       .encode(y=alt.Y("평균 매입가:Q", title=quote, scale=price_scale),
                               tooltip=alt.Tooltip("평균 매입가:Q", format=",.2f")))
         st.caption(f"주황색 점선 · 보유 평균 매입가 {average:,.2f} {quote} (매수 수수료 포함)")
-    price = alt.layer(*layers, trades).properties(height=460)
+    if markers:
+        layers.append(trades)
+    buys = [marker for marker in markers if marker["구분"] in ("매수", "롱 진입")]
+    if buys:
+        latest_buy = max(buys, key=lambda marker: datetime.fromisoformat(marker["시각"]))
+        layers.append(
+            alt.Chart(alt.Data(values=[latest_buy]))
+            .mark_text(align="right", dx=-5, dy=-13, fontWeight="bold", color="#2c70c1", clip=True)
+            .encode(x=x, y=alt.Y("체결가:Q", title=quote, scale=price_scale),
+                    text=alt.Text("체결가:Q", format=",.8~f"))
+        )
+    price = alt.layer(*layers).properties(height=435)
     volume = source.mark_bar(size=5).encode(
         y=alt.Y("거래량:Q", title="거래량"), color=direction
     ).properties(height=75)
@@ -405,8 +409,8 @@ def show_price_chart(candles, fills, settings, quote, boundary, now, count, indi
         .configure_legend(orient="top", symbolStrokeWidth=3)
     )
     st.altair_chart(chart, width="stretch")
-    refresh = " · 1초마다 조회" if seconds else ""
-    st.caption(f"최근 봉 {len(points)}개{refresh} · 삼각형은 현물 모의 체결가")
+    if markers:
+        st.caption("차트의 표식에 마우스를 올리면 매수·매도 또는 포지션 진입·종료 체결가를 확인할 수 있습니다.")
 
 
 def performance_points(candles, fills, initial_cash, minutes, adjustments=(), *, fee):
@@ -470,7 +474,7 @@ def performance_points(candles, fills, initial_cash, minutes, adjustments=(), *,
             "한국 시간": close_time.astimezone(KST).strftime("%Y-%m-%d %H:%M"),
             "누적 수익률": 100 * ((equity - net_funding) / initial_cash - 1) if initial_cash else None,
             "모의 전략": 100 * (adjusted / baseline_equity - 1) if baseline_equity > 0 else None,
-            "BTC 보유": 100 * (candle.closing / baseline_price - 1),
+            "선택 종목 보유": 100 * (candle.closing / baseline_price - 1),
         })
     return (points, drawdown) if points else ([], None)
 
@@ -494,8 +498,8 @@ def show_performance(candles, fills, rows, settings, quote, adjustments):
         st.info("첫 거래 또는 현금 조정 이후 확정 봉이 들어오면 수익률 추이를 표시합니다.")
         return
 
-    equity_tab, comparison_tab = st.tabs(["초기 자금 대비", "BTC 보유 비교"])
-    for tab, fields in ((equity_tab, ["누적 수익률"]), (comparison_tab, ["모의 전략", "BTC 보유"])):
+    equity_tab, comparison_tab = st.tabs(["초기 자금 대비", "선택 종목 보유와 비교"])
+    for tab, fields in ((equity_tab, ["누적 수익률"]), (comparison_tab, ["모의 전략", "선택 종목 보유"])):
         with tab:
             chart = (
                 alt.Chart(alt.Data(values=points))
@@ -511,7 +515,7 @@ def show_performance(candles, fills, rows, settings, quote, adjustments):
             )
             st.altair_chart(chart, width="stretch")
             if len(fields) == 2:
-                st.caption("같은 시작 시점의 수익률을 비교합니다. 전략은 현금 조정을 제외하고 BTC 보유는 거래 비용 없이 계산합니다.")
+                st.caption("같은 시점부터 비교합니다. 모의 전략 수익률은 현금 조정을 제외하고, 보유 수익률은 거래 비용을 제외합니다.")
     st.caption(f"표시 구간 최대 낙폭 {drawdown:.2f}% · 확정 봉 종가 기준")
 
 
@@ -524,20 +528,20 @@ def show_leverage_performance(market, events, totals, quote):
 
     closed = [
         (timestamp, row) for timestamp, row in events
-        if row["구분"] in LONG_TRADE_LABELS[1:] and row["실현 손익"] is not None
+        if row["구분"] in LEVERAGE_EXITS and row["실현 손익"] is not None
     ]
     completed = len(closed)
     wins = sum(row["실현 손익"] > 0 for _, row in closed)
-    liquidations = sum(row["구분"] == "강제청산" for _, row in closed)
+    liquidations = sum(row["구분"] in ("강제청산", "숏 강제청산") for _, row in closed)
     profit, win_rate, exits = st.columns(3)
     with profit:
         signed_metric("누적 실현 손익", totals.realized_pnl, f"{totals.realized_pnl:+,.2f} {quote}")
     win_rate.metric("승률", f"{wins / completed:.1%}" if completed else "—")
     exits.metric("종료 포지션", f"{completed:,}건", help=f"강제청산 {liquidations:,}건")
-    st.caption(f"롱 진입 {totals.entries:,}건 · 강제청산 {liquidations:,}건 · "
+    st.caption(f"롱·숏 진입 {totals.entries:,}건 · 강제청산 {liquidations:,}건 · "
                f"누적 수수료 {totals.fees:,.2f} {quote}")
     if not closed:
-        st.info("롱 포지션이 종료되면 실현 손익 추이를 표시합니다.")
+        st.info("레버리지 포지션이 종료되면 실현 손익 추이를 표시합니다.")
         return
 
     points = []
@@ -558,29 +562,11 @@ def show_leverage_performance(market, events, totals, quote):
     st.altair_chart(chart, width="stretch")
 
 
-def show_strategy(settings, quote):
-    st.subheader("전략 설정")
-    st.markdown(
-        f"**볼린저 밴드** · {settings['period']}개 봉 / "
-        f"표준편차 {settings['deviations']:g}배"
-    )
-    st.markdown(f"**초기 자금** · {settings['cash']:,.2f} {quote}")
-    st.markdown(f"**매수 배분** · 가용 현금의 {settings['allocation']:.2%}")
-    st.markdown(
-        f"**편도 거래 비용** · 수수료 {settings['fee']:.2%} / "
-        f"슬리피지 {settings['slippage']:.2%}"
-    )
-    threshold = settings.get("ml_threshold")
-    if threshold is not None:
-        st.markdown(f"**ML 매수 필터 임계값** · {threshold:g}")
-
-
 def show_manual_order(path, account, args, live, quote, asset):
     with st.container(border=True):
-        st.subheader("수동 모의매매")
-        if live is not None:
-            st.metric("최근 업비트 체결가", f"{live.closing:,.2f} {quote}")
-        order_type = st.radio("주문 방식", ("시장가", "지정가"), horizontal=True, key=f"{path}:order-type")
+        st.subheader("현물 주문")
+        order_type = st.radio("주문 방식", ("시장가", "지정가"), horizontal=True, key=f"{path}:order-type",
+                              help="시장가는 최근 시세로 즉시 체결을 시도합니다. 지정가는 설정한 가격 조건을 만족하면 체결됩니다.")
         is_limit = order_type == "지정가"
         reference = live.closing if live is not None else None
         order_args = args
@@ -635,7 +621,7 @@ def show_manual_order(path, account, args, live, quote, asset):
 
         action = "지정가 등록" if is_limit else "체결"
         if st.button(f"모의 {SIDE_LABELS[side]} {action}", key=f"{path}:{side}:submit",
-                     type="primary", disabled=estimate is None) and estimate is not None:
+                     type="primary", width="stretch", disabled=estimate is None) and estimate is not None:
             try:
                 if is_limit:
                     paper_limit_orders(path, order=(side, reference, size, unit))
@@ -679,7 +665,7 @@ def base_account_path():
     path = account_directory() / "paper.sqlite3"
     if not path.exists():
         settings = dict(market="KRW-BTC", minutes=15, period=20, deviations=2,
-                        cash=1_000_000, allocation=0.1, fee=0.0005, slippage=0.0005)
+                        cash=1_000_000, allocation=0.1, fee=0.0005, slippage=0.0005, account_mode="manual")
         with closing(sqlite3.connect(path)) as db, db:
             initialize_account(db, settings, settings["cash"])
     return path
@@ -764,10 +750,10 @@ def show_krw_market():
             "turnover": f"{turnover:,.1f}억" if turnover >= 1 else f"{turnover * 1e4:,.0f}만",
         })
 
-    st.caption(f"{len(rows):,}종목 · 24시간 거래대금순")
     if not rows:
         st.info("검색 결과가 없습니다.")
         return
+    st.caption(f"{len(rows):,}종목 · 최근 24시간 거래대금순")
     selected = st.session_state.get("active-market", "KRW-BTC")
     result = render_market_grid(key="krw-market-grid", data={"rows": rows, "selected": selected},
                                 on_selected_change=lambda: None)
@@ -776,9 +762,11 @@ def show_krw_market():
         st.rerun(scope="app")
 
 
-def show_leverage_order(path, settings, wallet, mark, quote, portfolio_cash):
+def show_leverage_order(path, settings, wallet, mark, quote, portfolio_cash, mode):
+    side = LEVERAGE_MODES[mode]
+    label = "롱" if side == "long" else "숏"
     with st.container(border=True):
-        st.subheader("레버리지 롱")
+        st.subheader(mode)
         st.caption("전체 포트폴리오 가용 현금 사용 · 격리 증거금 · 시장가")
         if wallet is None:
             return
@@ -798,32 +786,34 @@ def show_leverage_order(path, settings, wallet, mark, quote, portfolio_cash):
             fee, slippage = settings["fee"], settings["slippage"]
             max_margin = max(0.0, cash / (1 + leverage * fee))
             st.caption(f"가용 현금 기준 최대 증거금 {max_margin:,.2f} {quote} · 진입 수수료 반영")
-            preview = Long(margin, leverage, mark * (1 + slippage), fee, slippage) if margin and mark else None
+            preview = Position.at_market(side, mark, margin, leverage, fee, slippage) if margin and mark else None
             if preview is not None:
                 st.metric("포지션 금액", f"{preview.notional:,.2f} {quote}")
-                st.metric("예상 모의 청산가", f"{preview.liquidation_price:,.2f} {quote}" if leverage > 1 else "—")
+                st.metric("예상 모의 청산가", f"{preview.liquidation_price:,.2f} {quote}" if preview.liquidation_price > 0 else "—")
                 st.caption(f"예상 진입가 {preview.entry:,.2f} {quote} · 진입 수수료 {preview.entry_fee:,.2f} {quote}")
                 required = preview.margin + preview.entry_fee
                 if required > cash:
                     st.warning(f"증거금과 진입 수수료에 {required:,.2f} {quote}가 필요합니다.")
-                elif mark <= preview.liquidation_price:
-                    st.warning("현재가가 예상 모의 청산가 이하입니다. 레버리지 배율을 낮추세요.")
+                elif preview.is_liquidated(mark):
+                    st.warning("현재가가 예상 모의 청산 조건에 해당합니다. 레버리지 배율을 낮추세요.")
                 else:
-                    order = (margin, leverage, fee, slippage)
-            submit = st.button("모의 롱 진입", type="primary", disabled=order is None, key=f"{path}:long-open")
+                    order = (side, margin, leverage, fee, slippage)
+            submit = st.button(f"모의 {label} 진입", type="primary", disabled=order is None, key=f"{path}:{side}-open")
         else:
-            st.caption(f"{position.leverage}배 롱 · 진입가 {position.entry:,.2f} {quote}")
+            st.caption(f"{position.leverage}배 {position.label} · 진입가 {position.entry:,.2f} {quote}")
             st.metric("격리 증거금", f"{position.margin:,.2f} {quote}")
-            st.metric("모의 청산가", f"{position.liquidation_price:,.2f} {quote}" if position.leverage > 1 else "—")
+            st.metric("모의 청산가", f"{position.liquidation_price:,.2f} {quote}" if position.liquidation_price > 0 else "—")
             if mark is not None:
                 pnl = position.release(mark) - position.margin - position.entry_fee
                 signed_metric("예상 순손익", pnl, f"{pnl:+,.2f} {quote} ({pnl / position.margin:+.2%})")
-            submit = st.button("모의 롱 종료", disabled=mark is None, key=f"{path}:long-close")
+            if position.side != side:
+                st.info(f"{position.label} 포지션이 열려 있습니다. 포지션 종료 후 {label}으로 진입할 수 있습니다.")
+            submit = st.button(f"모의 {position.label} 종료", disabled=mark is None, key=f"{path}:leverage-close")
 
         if submit:
             try:
-                _, _, _, event, _ = paper_long(
-                    path, mark=mark, open_long=order, close_long=position is not None,
+                _, _, _, event, _ = paper_leverage(
+                    path, mark=mark, order=order, close_side=position.side if position else None,
                     portfolio_directory=base_account_path().parent,
                 )
             except (sqlite3.Error, ValueError) as error:
@@ -845,10 +835,10 @@ def show_leverage_order(path, settings, wallet, mark, quote, portfolio_cash):
                     st.caption(f"진입 {entry:,.2f} → 종료 {exit_price:,.2f} {quote}")
 
 
-def show_order_and_account(path, account, settings, args, live, quote, asset, orders, wallet, mark, portfolio_cash):
-    mode = st.radio("모의매매 유형", ("현물", "레버리지 롱"), horizontal=True, key=f"{path}:trade-mode")
-    if mode == "레버리지 롱":
-        show_leverage_order(path, settings, wallet, mark, quote, portfolio_cash)
+def show_order_panel(path, account, settings, args, live, quote, asset, orders, wallet, mark, portfolio_cash):
+    mode = st.radio("모의매매 유형", ("현물", *LEVERAGE_MODES), horizontal=True, key=f"{path}:trade-mode")
+    if mode in LEVERAGE_MODES:
+        show_leverage_order(path, settings, wallet, mark, quote, portfolio_cash, mode)
     else:
         show_manual_order(path, account, args, live, quote, asset)
 
@@ -862,8 +852,10 @@ def show_order_and_account(path, account, settings, args, live, quote, asset, or
                     paper_limit_orders(path, cancel=order["id"])
                     st.rerun(scope="app")
 
-    with st.expander("가용 현금 및 계좌 관리"):
-        st.caption(f"{settings['market']} 선택 계좌 가용 현금 {account['cash']:,.2f} {quote}")
+
+def show_cash_and_accounts(path, settings, quote):
+    with st.expander("가상 현금 조정 및 계좌 전환"):
+        st.caption("현금 조정은 기존 체결 내역을 유지합니다. 새 계좌는 체결 내역 없이 시작합니다.")
         target = amount_input(f"변경할 전체 가용 현금 ({quote})", key="portfolio-cash-target")
         if st.button("전체 가용 현금 변경", disabled=target is None, key="apply-portfolio-cash"):
             try:
@@ -877,7 +869,7 @@ def show_order_and_account(path, account, settings, args, live, quote, asset, or
             st.success("전체 가용 현금을 변경했습니다.")
 
         base_path = base_account_path()
-        paths = [base_path, *sorted(path.parent.glob("*.sqlite3"))]
+        paths = [base_path, *manual_account_paths(path.parent)]
         paths = list(dict.fromkeys([*paths, path]))
         if len(paths) > 1:
             selected = st.selectbox(
@@ -887,7 +879,6 @@ def show_order_and_account(path, account, settings, args, live, quote, asset, or
             if selected != path:
                 st.session_state["next-paper-db"] = str(selected)
                 st.rerun(scope="app")
-        st.caption("새 계좌에서 빈 체결 내역으로 시작할 수 있습니다.")
         starting_cash = amount_input(f"새 계좌 초기 자금 ({quote})", minimum=0.01,
                                     value=float(settings["cash"]), key=f"{path}:grouped-new-cash")
         if st.button("새 모의계좌 시작", disabled=starting_cash is None, key=f"{path}:new-account"):
@@ -897,7 +888,7 @@ def show_order_and_account(path, account, settings, args, live, quote, asset, or
                 new_path = Path(filename)
                 try:
                     with closing(sqlite3.connect(new_path)) as db, db:
-                        initialize_account(db, {**settings, "cash": starting_cash}, starting_cash)
+                        initialize_account(db, {**settings, "cash": starting_cash, "account_mode": "manual"}, starting_cash)
                 except sqlite3.Error:
                     new_path.unlink(missing_ok=True)
                     raise
@@ -913,33 +904,33 @@ def portfolio_totals(directory, active_path, account, settings, rows, adjustment
                   realized=0.0, position_value=0.0, unrealized=0.0)
     missing_markets = set()
     unavailable = 0
-    for path in sorted({active_path, *directory.glob("*.sqlite3")}):
+    for path in sorted({active_path, *manual_account_paths(directory)}):
         try:
             if path == active_path:
-                current, config, trades, funding, long_wallet = account, settings, rows, adjustments, wallet
+                current, config, trades, funding, leverage_wallet = account, settings, rows, adjustments, wallet
             else:
                 current, fills, funding = read_account(path)
                 if current is None:
                     continue
                 config = json.loads(current["settings"])
                 trades = trade_rows(fills, config["fee"])
-                long_wallet = paper_long(path)
-            if long_wallet is None:
+                leverage_wallet = paper_leverage(path)
+            if leverage_wallet is None:
                 unavailable += 1
                 continue
         except (sqlite3.Error, ValueError, KeyError, TypeError):
             unavailable += 1
             continue
 
-        cash, long_position, _, _, long_totals = long_wallet
+        cash, position, _, _, leverage_totals = leverage_wallet
         totals["cash"] += cash
         totals["initial"] += config["cash"]
         totals["funding"] += sum(item["amount"] for item in funding)
-        totals["trades"] += current["trades"] + long_totals.entries + long_totals.exits
-        totals["fees"] += sum(row["수수료"] for row in trades) + long_totals.fees
-        totals["realized"] += sum(row["실현 손익"] or 0.0 for row in trades) + long_totals.realized_pnl
+        totals["trades"] += current["trades"] + leverage_totals.entries + leverage_totals.exits
+        totals["fees"] += sum(row["수수료"] for row in trades) + leverage_totals.fees
+        totals["realized"] += sum(row["실현 손익"] or 0.0 for row in trades) + leverage_totals.realized_pnl
 
-        if not current["units"] and long_position is None:
+        if not current["units"] and position is None:
             continue
         market = config["market"]
         price = prices.get(market)
@@ -950,23 +941,402 @@ def portfolio_totals(directory, active_path, account, settings, rows, adjustment
         spot_average = (trades[0]["체결 후 평균 매입가"] or 0.0) if trades else 0.0
         totals["position_value"] += spot_value
         totals["unrealized"] += spot_value - current["units"] * spot_average
-        if long_position is not None:
-            long_value = long_position.release(price)
-            totals["position_value"] += long_value
-            totals["unrealized"] += long_value - long_position.margin - long_position.entry_fee
+        if position is not None:
+            position_value = position.release(price)
+            totals["position_value"] += position_value
+            totals["unrealized"] += position_value - position.margin - position.entry_fee
     return totals, missing_markets, unavailable
 
 
+def account_performance(equity, initial_cash, funding):
+    profit = equity - funding - initial_cash
+    return profit, 100 * profit / initial_cash if initial_cash > 0 else None
+
+
+def show_return_history(path, return_pct, title=None):
+    with closing(sqlite3.connect(f"{path.as_uri()}?mode=rw", uri=True)) as db, db:
+        record_hourly_return(db, return_pct, datetime.now(timezone.utc))
+        history = db.execute("""SELECT time, return_pct FROM returns_by_hour
+                               ORDER BY time DESC LIMIT 720""").fetchall()
+    with (st.expander(title) if title else nullcontext()):
+        if not history:
+            st.info("평가 시세를 확인하면 수익률 추이를 표시합니다.")
+            return
+        points = [{"시각": timestamp, "수익률": value,
+                   "색상": direction_color(value) or NEUTRAL} for timestamp, value in reversed(history)]
+        base = alt.Chart(alt.Data(values=points)).encode(
+            x=kst_axis("시각 (KST)"), y=alt.Y("수익률:Q", title="수익률 (%)"),
+            tooltip=[alt.Tooltip("수익률:Q", format="+.4f")],
+        )
+        st.altair_chart((base.mark_line(color=NEUTRAL) +
+                         base.mark_circle(size=45).encode(color=alt.Color("색상:N", scale=None, legend=None)))
+                        .properties(height=180), width="stretch")
+        st.caption("시간대별 첫 기록 수익률 · 최근 720개")
+
+
+def auto_log_table(events):
+    if not events:
+        return
+    labels = {**SIDE_LABELS, "HOLD": "대기", "SKIP": "건너뜀"}
+    rows = [{
+        "시각 (KST)": local_time(event["time"]).strftime("%Y-%m-%d %H:%M:%S"),
+        "기준 봉 (KST)": local_time(event["candle"]).strftime("%Y-%m-%d %H:%M") if event["candle"] else None,
+        "판단": labels.get(event["side"], event["side"]),
+        "근거": event["reason"],
+        "수량": event.get("quantity"),
+        "체결가": event.get("price"),
+        "수수료": event.get("fee"),
+    } for event in events]
+    st.dataframe(rows, hide_index=True)
+
+
+def show_auto_backtest(args):
+    key = f"auto-backtest:{args.market}:{args.strategy}:v{args.strategy_version}"
+    with st.expander("과거 차트로 수익률 계산해 보기"):
+        st.caption("선택한 전략으로 과거에 거래했다면 수익률이 어땠을지 확인해 보세요. "
+                   "최근 마감된 1시간봉을 최대 200개 사용해 현물 거래를 가정하고, 수수료와 가격 차이를 반영합니다.")
+        if st.button("과거 시세로 검증하기", key=key):
+            st.session_state.pop(key + ":result", None)
+            boundary = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+            try:
+                candles = [candle for candle in recent_candles(args, boundary, count=200)
+                           if candle.start + timedelta(hours=1) <= boundary]
+                st.session_state[key + ":result"] = replay(candles, args)
+            except (URLError, TimeoutError, KeyError, TypeError):
+                st.warning("전략 검증에 사용할 과거 시세를 가져오지 못했습니다.")
+            except ValueError:
+                st.warning("전략을 검증하기에 마감된 1시간봉이 부족합니다.")
+        result = st.session_state.get(key + ":result")
+        if result:
+            events, summary = result
+            st.metric("최종 평가액", f"{summary['equity']:,.2f} KRW")
+            st.metric("체결", f"{summary['fills']}건")
+            value = summary["return_pct"]
+            signed_metric("수익률", value, f"{value:+.4f}%")
+            st.caption(f"총 체결 수수료 {sum(event.get('fee', 0) for event in events):,.2f} KRW")
+            auto_log_table(list(reversed(events)))
+            buys = sum(event["side"] == "BUY" for event in events)
+            sells = sum(event["side"] == "SELL" for event in events)
+            profit = summary["equity"] - args.cash
+            if not buys:
+                evaluation = "이 구간에서는 매수 조건을 충족한 체결이 없어 초기 자금이 유지됐습니다."
+            elif profit == 0:
+                evaluation = f"매수 {buys}건, 매도 {sells}건이 체결됐고 최종 평가액은 초기 자금과 같았습니다."
+            else:
+                change = "늘었습니다" if profit > 0 else "줄었습니다"
+                evaluation = (f"매수 {buys}건, 매도 {sells}건이 체결됐고 "
+                              f"비용 반영 후 최종 평가액은 초기 자금보다 {abs(profit):,.2f}원 {change}.")
+            if summary["units"] > 0:
+                evaluation += " 마지막까지 보유한 코인은 마지막 봉의 종가로 평가했습니다."
+            st.markdown("**결과 요약**")
+            st.write(evaluation)
+
+
+def initialize_auto_account(db, settings):
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        initialize_account(db, settings, settings["cash"])
+        saved, = db.execute("SELECT settings FROM account WHERE id=1").fetchone()
+        saved_settings = json.loads(saved)
+        if "strategy" not in saved_settings:
+            saved_settings.update(strategy="bollinger", strategy_version=1)
+            db.execute("UPDATE account SET settings=? WHERE id=1", (json.dumps(saved_settings),))
+    return saved_settings
+
+
+def auto_sizing_controls(path, settings, enabled):
+    leverage = settings.get("rapid_leverage", DEFAULT_LEVERAGE)
+    levels = tuple(LEVERAGE_LEVELS)
+    default_level = next((name for name in levels if LEVERAGE_LEVELS[name] == leverage), levels[0])
+    level = st.select_slider("부자 되고 싶은 마음", options=levels, value=default_level,
+                            format_func=lambda name: f"{name} · {LEVERAGE_LEVELS[name]}배",
+                            key=f"auto-leverage:{path.name}", disabled=enabled)
+    saved_percent = settings.get("rapid_entry_percent", LEGACY_ENTRY_PERCENT)
+    entry_percent = saved_percent
+    if enabled and saved_percent == LEGACY_ENTRY_PERCENT:
+        st.caption("현재 가용 현금 사용 비율은 5%입니다. 자동매매를 종료한 뒤 새 비율로 시작할 수 있습니다.")
+    else:
+        entry_percent = st.select_slider(
+            "가용 현금 사용 비율", options=ENTRY_PERCENTAGES,
+            value=saved_percent if saved_percent in ENTRY_PERCENTAGES else ENTRY_PERCENTAGES[0],
+            format_func=lambda percent: f"{percent}%", key=f"auto-entry-percent:{path.name}", disabled=enabled,
+            help="새 포지션의 증거금과 진입 수수료에 사용할 가용 현금의 비율입니다.",
+        )
+    return {"rapid_leverage": LEVERAGE_LEVELS[level], "rapid_entry_percent": entry_percent}
+
+
+def show_auto_schedule(path, settings, existing):
+    enabled = False
+    if existing:
+        with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)) as db:
+            enabled = auto_enabled(db)
+    llm = settings["strategy"] == LLM_STRATEGY
+    if llm:
+        sizing = {}
+        st.caption("LLM이 진입할 때마다 레버리지와 가용 현금 사용 비율을 결정합니다.")
+    else:
+        sizing = auto_sizing_controls(path, settings, enabled)
+    st.caption("배율과 사용 비율은 새 포지션에 적용됩니다. 자동매매를 종료하면 기존 포지션은 유지됩니다.")
+    online = worker_online() or (settings["market"] == "KRW-BTC" and st.session_state.get("cloud-btc-worker-online"))
+    if enabled and online:
+        st.caption("자동 모의매매 진행 중 · 마감 1분봉마다 신호를 확인합니다.")
+    elif enabled:
+        st.warning("자동 모의매매가 등록되었습니다. 별도 실행 프로그램이 시작되면 매매를 확인합니다.")
+    else:
+        st.caption("시작 후 새로 마감된 1분봉부터 신호를 확인합니다.")
+    label = "자동 모의매매 종료" if enabled else "자동 모의매매 시작"
+    missing_key = llm and not openai_settings()[0]
+    if missing_key:
+        st.warning("OpenAI API 키를 서버에 설정하면 LLM 분석을 사용할 수 있습니다.")
+    if st.button(label, key=f"auto-schedule:{path.name}", disabled=missing_key and not enabled,
+                 type="secondary" if enabled else "primary", width="stretch"):
+        with closing(sqlite3.connect(path)) as db:
+            saved = initialize_auto_account(db, settings)
+            with db:
+                set_auto_enabled(db, not enabled)
+                if not enabled:
+                    saved.update(rapid_profile=1, **sizing)
+                    db.execute("UPDATE account SET settings=? WHERE id=1", (json.dumps(saved),))
+                    activate_rapid_strategy(db, datetime.now(timezone.utc))
+                else:
+                    save_auto_decision(db, "종료", "자동매매를 종료했습니다. 기존 포지션은 유지합니다.")
+        operation_logger("dashboard").info("Automatic strategy %s market=%s strategy=%s",
+                                           "stopped" if enabled else "started", settings["market"], settings["strategy"])
+        st.rerun(scope="app")
+
+
+def show_auto_account(manual_path, settings):
+    market = settings["market"]
+    st.subheader("자동매매 설정")
+    strategies = tuple(AUTO_STRATEGIES)
+    if "auto-strategy" not in st.session_state:
+        st.session_state["auto-strategy"] = st.session_state.get("selected-auto-strategy", "bollinger")
+    strategy = st.selectbox("자동매매 전략 선택", strategies, format_func=AUTO_STRATEGIES.__getitem__, key="auto-strategy")
+    st.session_state["selected-auto-strategy"] = strategy
+    suffix = "" if strategy == "bollinger" and STRATEGY_VERSION == 1 else f"-{strategy}-v{STRATEGY_VERSION}"
+    path = manual_path.parent / f"paper-auto-{market}{suffix}.sqlite3"
+    st.caption("종목과 전략별로 잔고와 포지션을 따로 저장합니다.")
+    existing = path.exists()
+    auto_settings = {"market": market, "minutes": 60, "cash": 1_000_000, "allocation": 0.05,
+                     "account_mode": "auto", "strategy": strategy, "strategy_version": STRATEGY_VERSION,
+                     "period": 20, "deviations": 2, "fee": settings["fee"], "slippage": settings["slippage"]}
+    if existing:
+        account, fills, adjustments = read_account(path)
+        auto_settings.update(json.loads(account["settings"]))
+    args = SimpleNamespace(**{"ml_threshold": None, **auto_settings})
+    show_auto_schedule(path, auto_settings, existing)
+    with st.expander("자동매매 기준"):
+        if strategy == LLM_STRATEGY:
+            st.write("5분마다 OpenAI에 마감 차트와 지표를 보내 판단합니다. 진입 배율은 2·5·10·20배, 가용 현금 사용 비율은 20·40·60·80·100% 중에서 선택합니다. 손절·익절·청산은 1분마다 확인합니다.")
+        else:
+            st.write("1시간봉으로 추세를 확인하고 마감된 1분봉으로 진입을 판단합니다. "
+                     "설정한 배율로 롱·숏 모의매매를 합니다. 진입 증거금과 수수료를 합쳐 선택한 비율만큼 가용 현금을 사용합니다.")
+    if strategy != LLM_STRATEGY:
+        show_auto_backtest(args)
+    return path, auto_settings
+
+
+def show_auto_performance(path, settings, latest_price, performance_panel):
+    market = settings["market"]
+    strategy = settings["strategy"]
+    if not path.exists():
+        performance_panel.info("이 전략을 처음 실행하면 가상 자금 1,000,000 KRW가 지급되고 성과가 표시됩니다.")
+        return [], None, []
+    account, fills, adjustments = read_account(path)
+    if account["last"] and not settings.get("rapid_profile"):
+        processed = local_time(account["last"]) - timedelta(hours=1)
+        performance_panel.caption(f"마지막 처리 봉 · {processed:%Y-%m-%d %H:%M} KST")
+    rows = trade_rows(fills, settings["fee"])
+    wallet = paper_leverage(path) if settings.get("rapid_profile") else None
+    position = wallet[1] if wallet else None
+    realized = sum(row["실현 손익"] or 0.0 for row in rows) + (wallet[4].realized_pnl if wallet else 0.0)
+    funding = sum(item["amount"] for item in adjustments)
+    equity = (account["cash"] + account["units"] * (latest_price or 0.0)
+              if latest_price is not None or not (account["units"] or position) else None)
+    if position is not None and latest_price is not None:
+        equity += position.release(latest_price)
+    profit, return_pct = account_performance(equity, settings["cash"], funding) if equity is not None else (None, None)
+    with performance_panel:
+        st.caption(f"{market} · {AUTO_STRATEGIES[strategy]} · 최신 조회 시세 기준")
+        equity_col, profit_col, return_col, realized_col = st.columns(4)
+        equity_col.metric("평가자산", f"{equity:,.2f} KRW" if equity is not None else "시세 필요", border=True)
+        for col, title, value, suffix in (
+                (profit_col, "누적 손익", profit, " KRW"),
+                (return_col, "수익률 · 입출금 제외", return_pct, "%"),
+                (realized_col, "누적 실현 손익", realized, " KRW")):
+            text = format(value, "+,.4f" if suffix == "%" else "+,.2f") + suffix if value is not None else "—"
+            with col:
+                signed_metric(title, value, text, border=True)
+        st.caption(f"초기 자금 {settings['cash']:,.2f} KRW · "
+                   f"가용 현금 {account['cash']:,.2f} KRW · 보유 {account['units']:.8f} {market.split('-')[1]}")
+    with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)) as db:
+        exists = db.execute("SELECT 1 FROM sqlite_master WHERE name='auto_decision'").fetchone()
+        last = db.execute("SELECT time, side, reason, candle FROM auto_decision").fetchone() if exists else None
+        has_log = db.execute("SELECT 1 FROM sqlite_master WHERE name='auto_run_log'").fetchone()
+        db.row_factory = sqlite3.Row
+        events = [dict(row) for row in db.execute(
+            "SELECT * FROM auto_run_log ORDER BY id DESC LIMIT 200"
+        )] if has_log else []
+    with performance_panel:
+        if position is not None:
+            st.caption(f"모의 {position.label} {position.leverage}배 · 진입가 {position.entry:,.2f} KRW · "
+                       f"청산가 {position.liquidation_price:,.2f} KRW")
+        elif not account["units"]:
+            st.caption("보유 포지션 없음 · 전액 가상 현금")
+        if last:
+            timestamp, side, reason, candle = last
+            status = {**SIDE_LABELS, "HOLD": "대기", "SKIP": "건너뜀"}.get(side, side)
+            st.write(f"마지막 자동매매 판단 · {status} · {local_time(timestamp):%Y-%m-%d %H:%M:%S} KST")
+            st.caption(reason + (f" · 기준 봉 {local_time(candle):%Y-%m-%d %H:%M} KST" if candle else ""))
+    executions = sorted(execution_events(path, market, fills, rows), reverse=True, key=lambda event: event[0])
+    show_auto_report(path, settings, latest_price, equity, profit, return_pct, executions, performance_panel)
+    return events, return_pct, executions
+
+
+def show_auto_report(path, settings, latest_price, equity, profit, return_pct, executions, panel):
+    market = settings["market"]
+
+    def benchmark(first):
+        if latest_price is None:
+            return None
+        start = datetime.fromisoformat(first).replace(second=0, microsecond=0)
+        try:
+            candles = recent_candles(SimpleNamespace(market=market, minutes=1), start + timedelta(minutes=1), count=1)
+            if candles and candles[-1].start == start:
+                return 100 * (latest_price / candles[-1].closing - 1)
+        except (URLError, TimeoutError, ValueError, KeyError, TypeError):
+            return None
+        return None
+
+    with panel:
+        button_label = "AI 자동매매 보고서 작성" if settings["strategy"] == LLM_STRATEGY else "자동매매 보고서 작성"
+        if st.button(button_label, key=f"report:{path.name}", type="primary"):
+            try:
+                with st.spinner("성과를 집계하고 보고서를 작성하는 중입니다…"):
+                    report = build_auto_report(path, settings, equity, profit, return_pct, executions,
+                                               now=datetime.now(timezone.utc), benchmark=benchmark)
+                    analysis, error = interpret_report(report)
+                st.session_state["latest-auto-report"] = (path, report, analysis, error)
+                operation_logger("dashboard").info("Report generated market=%s ai_summary=%s", market, bool(analysis))
+                if error:
+                    operation_logger("dashboard").warning("Report model unavailable market=%s detail=%s", market, error)
+            except (sqlite3.Error, OSError, ValueError) as error:
+                operation_logger("dashboard").warning("Report generation failed type=%s", type(error).__name__)
+                st.error("보고서에 사용할 계좌 기록을 읽지 못했습니다.")
+        saved = st.session_state.get("latest-auto-report")
+        if not saved or saved[0] != path:
+            return
+        _, report, analysis, error = saved
+        with st.expander("AI 자동매매 보고서", expanded=True):
+            st.caption(f"{market} · {report['strategy']} · 작성 시각 {report['generated_at']} · 모의매매 기록")
+            if report["first_decision"]:
+                st.caption(f"판단 기록 {report['first_decision']} ~ {report['last_decision']} (KST)")
+            if report.get("report_model"):
+                st.caption(f"보고서 모델 {report['report_model']}")
+            st.download_button("보고서 다운로드 (.md)", report_markdown(report, analysis, error),
+                               file_name=f"paper-report-{market}-{settings['strategy']}.md",
+                               mime="text/markdown", on_click="ignore")
+            st.dataframe(pd.DataFrame(report_metrics(report), columns=["지표", "값"]), hide_index=True)
+            trend, trades = st.columns(2)
+            if report["history"]:
+                history = pd.DataFrame(report["history"], columns=["시각", "수익률 (%)"])
+                trend.altair_chart(alt.Chart(history).mark_line(point=True).encode(
+                    x=kst_axis("시각 (KST)"), y="수익률 (%):Q",
+                    tooltip=["수익률 (%):Q"],
+                ), width="stretch")
+            if report["trade_counts"]:
+                counts = pd.DataFrame(list(report["trade_counts"].items()), columns=["체결 구분", "건수"])
+                trades.bar_chart(counts, x="체결 구분", y="건수")
+            breakdown = [("판단", label, count) for label, count in report["decision_counts"].items()]
+            breakdown.extend(("종료 근거", label, count) for label, count in report["exit_reasons"].items())
+            breakdown.extend(("진입 레버리지", f"{leverage}배", count)
+                             for leverage, count in report["leverage_counts"].items())
+            breakdown.extend(("진입 자금 비율", f"{ratio}%" if ratio.isdigit() else ratio, count)
+                             for ratio, count in report["entry_percent_counts"].items())
+            if breakdown:
+                st.dataframe(pd.DataFrame(breakdown, columns=["항목", "구분", "건수"]), hide_index=True)
+            if report["notable_trades"]:
+                st.write("손익 영향이 큰 거래")
+                show_trades(report["notable_trades"])
+            st.write("AI 종합 평가")
+            if analysis:
+                st.text(analysis)
+            else:
+                st.info(error or "AI 요약 없이 집계 결과를 표시합니다.")
+
+
+def show_auto_history(path, events, return_pct, executions):
+    decisions, returns = st.tabs(("AI 자동매매 내역", "자동 수익률 추이"))
+    with decisions:
+        if events:
+            st.caption("최근 판단 200건")
+            auto_log_table(events)
+        else:
+            st.info("자동매매를 시작하면 판단 내역이 표시됩니다.")
+        if executions:
+            with st.expander("체결 상세"):
+                show_trades([row for _, row in executions])
+    with returns:
+        if path.exists():
+            show_return_history(path, return_pct)
+        else:
+            st.info("자동매매를 시작하면 수익률 추이가 표시됩니다.")
+
+
+def show_scheduled_comparison(directory):
+    if not JOB_FILE.is_file():
+        return
+    now = datetime.now(timezone.utc)
+    minute = now.replace(second=0, microsecond=0)
+    if st.session_state.get("comparison-checked-minute") != minute:
+        st.session_state["comparison-checked-minute"] = minute
+        try:
+            job = json.loads(JOB_FILE.read_text())
+            if activation_times(directory) == job["anchors"]:
+                st.session_state["comparison-report-path"] = collect_report(directory, now)
+        except (OSError, ValueError, KeyError) as error:
+            operation_logger("dashboard").warning("Scheduled comparison check failed type=%s", type(error).__name__)
+    output = st.session_state.get("comparison-report-path")
+    if output:
+        st.download_button("비트코인 전략 비교 보고서 다운로드", output.read_text(),
+                           file_name=output.name, mime="text/markdown", on_click="ignore")
+
+
+def show_cloud_comparison(path):
+    now = datetime.now(KST)
+    cutoff = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    job = read_cloud_comparison(path)
+    st.session_state["cloud-btc-worker-online"] = False
+    if job:
+        deadline, checked, report = job
+        deadline = datetime.fromisoformat(deadline).astimezone(KST)
+        if report:
+            date = deadline.date() - timedelta(days=1)
+            st.download_button("클라우드 비트코인 비교 보고서 다운로드", report,
+                               file_name=f"btc-comparison-{date}.md", mime="text/markdown", on_click="ignore")
+        elif checked:
+            last = datetime.fromisoformat(checked).astimezone(KST)
+            st.session_state["cloud-btc-worker-online"] = now < deadline and timedelta(0) <= now - last <= timedelta(minutes=3)
+            st.caption(f"클라우드 비교 마감 {deadline:%m-%d %H:%M} KST · 마지막 확인 {last:%H:%M:%S} KST")
+        else:
+            st.caption(f"클라우드 비교 예약 · 마감 {deadline:%m-%d %H:%M} KST · GitHub Actions 작업 대기")
+        if deadline > now or (not report and now - deadline < timedelta(minutes=5)):
+            return
+    if st.button("비트코인 자정 비교 예약", key="cloud-btc-comparison"):
+        schedule_cloud_comparison(path, cutoff)
+        st.rerun(scope="app")
+
+
 def show_portfolio(directory, path, account, settings, rows, adjustments, wallet):
-    st.subheader("전체 포트폴리오")
+    st.subheader("전체 종목 잔고")
     try:
         prices = {ticker["market"]: float(ticker["trade_price"]) for ticker in load_krw_tickers()}
     except (URLError, TimeoutError, ValueError, KeyError, TypeError):
         prices = {}
     totals, missing, unavailable = portfolio_totals(directory, path, account, settings, rows,
                                                     adjustments, wallet, prices)
-    cash, count, fees, realized = st.columns(4)
-    equity, performance, open_profit = st.columns(3)
+    equity, cash, performance = st.columns(3)
+    realized, open_profit, count, fees = st.columns(4)
     if unavailable:
         st.warning(f"계좌 {unavailable:,}개의 데이터를 불러오지 못해 전체 집계를 표시할 수 없습니다.")
     status = "계좌 조회 필요" if unavailable else "시세 필요" if missing else None
@@ -976,6 +1346,7 @@ def show_portfolio(directory, path, account, settings, rows, adjustments, wallet
     with realized:
         signed_metric("누적 실현 손익", None if unavailable else totals["realized"],
                       "—" if unavailable else f"{totals['realized']:+,.2f} KRW", border=True)
+    return_pct = None
     if status:
         equity.metric("평가자산", status, border=True)
         performance.metric("현금 조정 제외 수익률", status, border=True)
@@ -984,35 +1355,50 @@ def show_portfolio(directory, path, account, settings, rows, adjustments, wallet
             st.caption(f"시세를 불러오지 못한 종목 · {', '.join(sorted(missing))}")
     else:
         total_equity = totals["cash"] + totals["position_value"]
-        return_pct = 100 * ((total_equity - totals["funding"]) / totals["initial"] - 1)
+        profit, return_pct = account_performance(total_equity, totals["initial"], totals["funding"])
         equity.metric("평가자산", f"{total_equity:,.2f} KRW", border=True)
+        with equity:
+            st.caption("누적 손익 " + signed_text(profit, f"{profit:+,.2f} KRW"), unsafe_allow_html=True)
         with performance:
-            signed_metric("현금 조정 제외 수익률", return_pct, f"{return_pct:+.4f}%", border=True)
+            signed_metric("현금 조정 제외 수익률", return_pct, f"{return_pct:+.4f}%" if return_pct is not None else "—", border=True)
         with open_profit:
             signed_metric("보유 평가손익", totals["unrealized"], f"{totals['unrealized']:+,.2f} KRW", border=True)
-    st.caption("내 모든 모의계좌 합산 · 평가 시세는 원화 마켓 기준으로 최대 1분간 캐시됩니다.")
+    show_return_history(base_account_path(), return_pct, "수동 수익률 추이")
     return totals["cash"] if not unavailable else None
 
 
 @st.fragment(run_every="1s")
-def show_account(path, config, *, guest):
-    if guest:
-        render_account(path, guest=True)
-    else:
-        with show_storage_error(), account_changes(config):
-            render_account(path, guest=False)
+def show_account(path, config, *, guest, mode):
+    try:
+        if guest:
+            render_account(path, guest=True, mode=None)
+        else:
+            with show_storage_error(), account_changes(config):
+                show_scheduled_comparison(path.parent)
+                if mode == "자동매매":
+                    show_cloud_comparison(base_account_path())
+                render_account(path, guest=False, mode=mode)
+    except Exception as error:
+        frame = error.__traceback__
+        while frame.tb_next is not None:
+            frame = frame.tb_next
+        operation_logger("dashboard").error("Dashboard render failed type=%s location=%s:%d",
+                                            type(error).__name__, Path(frame.tb_frame.f_code.co_filename).name,
+                                            frame.tb_lineno)
+        raise
 
 
 def show_guest_actions():
     with st.container(border=True):
-        st.subheader("모의 주문")
-        for label in ("현물 매수", "현물 매도", "레버리지 롱 진입", "가용 현금 및 계좌 관리"):
-            if st.button(label, width="stretch"):
-                st.session_state["show-login-dialog"] = True
-                st.rerun(scope="app")
+        st.subheader("모의매매 시작")
+        st.write("시세와 차트는 누구나 볼 수 있습니다. 로그인하면 가상 자금으로 주문하고 거래 내역을 저장할 수 있습니다.")
+        if st.button("로그인", type="primary", width="stretch", key="guest-login"):
+            navigate("login")
+        if st.button("회원가입", width="stretch", key="guest-signup"):
+            navigate("signup")
 
 
-def render_account(path, *, guest):
+def render_account(path, *, guest, mode):
     if not path.is_file():
         st.info("계좌 파일이 없습니다. 모의매매 에이전트를 한 번 실행해 기본 계좌를 만드세요.")
         return
@@ -1029,24 +1415,6 @@ def render_account(path, *, guest):
     market = settings["market"]
     quote, asset = market.split("-", maxsplit=1)
     rows = trade_rows(fills, settings["fee"])
-    st.markdown(f"""
-<div style="background: linear-gradient(115deg, #18264e, #273882 58%, #0e6266); color: #fff;
-            border-radius: 18px; padding: 24px 28px; margin-bottom: 8px;">
-  <div style="font-size: 0.82rem; color: #bdeaff; font-weight: 650;">모의매매</div>
-  <div style="font-size: clamp(1.8rem, 5vw, 2.8rem); font-weight: 740;">{escape(market)}</div>
-  <div style="color: #e0eaff;">볼린저 밴드 · {int(settings['minutes'])}분봉</div>
-</div>
-""", unsafe_allow_html=True)
-
-    last = account["last"]
-    if last:
-        processed = local_time(last)
-        age = datetime.now(KST) - processed
-        status = "최근 봉 처리 기록 지연 · " if age >= timedelta(minutes=2 * settings["minutes"]) else ""
-        st.caption(f"{status}마지막 처리 봉 {processed:%Y-%m-%d %H:%M} KST")
-    else:
-        st.caption("처리된 봉 없음")
-
     args = SimpleNamespace(**{"ml_threshold": None, **settings})
     try:
         now, boundary, market_candles = load_account_market(settings)
@@ -1058,7 +1426,6 @@ def render_account(path, *, guest):
         market_candles = []
         st.warning("업비트 공개 시세를 불러오지 못했습니다. 잠시 후 다시 조회합니다.")
 
-    seconds = int(now.timestamp())
     candles = [candle for candle in market_candles if candle.start < boundary]
     latest = market_candles[-1] if market_candles else None
     live = latest if latest is not None and latest.start == boundary else None
@@ -1070,16 +1437,17 @@ def render_account(path, *, guest):
     mark = None
     try:
         if not guest:
-            wallet = paper_long(path)
-        if ((wallet is not None and wallet[1] is not None) or st.session_state.get(f"{path}:trade-mode") == "레버리지 롱"
-                or st.session_state.get(f"{path}:chart-interval") == 0):
+            wallet = paper_leverage(path)
+        if ((wallet is not None and wallet[1] is not None)
+                or (mode == "수동매매" and st.session_state.get(f"{path}:trade-mode") in LEVERAGE_MODES)):
             second_candles = load_second_candles(market, second_boundary)
             if second_candles and timedelta(0) <= datetime.now(timezone.utc) - second_candles[-1].start < timedelta(seconds=10):
                 mark = second_candles[-1].closing
-            if wallet is not None and wallet[1] is not None and mark is not None and mark <= wallet[1].liquidation_price:
-                wallet = paper_long(path, mark=mark)
+            position = wallet[1] if wallet is not None else None
+            if position is not None and mark is not None and position.is_liquidated(mark):
+                wallet = paper_leverage(path, mark=mark)
                 if wallet[3]:
-                    st.warning("레버리지 롱이 모의 강제청산됐습니다.")
+                    st.warning(f"레버리지 {position.label}이 모의 강제청산됐습니다.")
     except (URLError, TimeoutError, ValueError, KeyError, TypeError):
         pass
     except sqlite3.Error:
@@ -1100,11 +1468,96 @@ def render_account(path, *, guest):
         except sqlite3.Error as error:
             orders = []
             st.warning(f"지정가 주문을 확인할 수 없습니다 · {error}")
-        net_funding = sum(event["amount"] for event in adjustments)
+
+    workspace = st.container(key="market-workspace")
+    with workspace:
+        if mode == "자동매매":
+            performance_panel = st.container(key="auto-live-performance")
+            performance_panel.subheader("자동매매 실시간 성과")
+        if guest or mode is not None:
+            chart_panel, order_panel = st.columns([7, 3], gap="medium")
+        else:
+            chart_panel = workspace
+    executions = []
+    if mode == "자동매매":
+        with order_panel.container(border=True):
+            auto_path, auto_settings = show_auto_account(path, settings)
+        events, return_pct, executions = show_auto_performance(
+            auto_path, auto_settings, live.closing if live else None, performance_panel
+        )
+    elif mode == "수동매매":
+        try:
+            executions = execution_events(path, market, fills, rows)
+        except sqlite3.Error:
+            st.warning("선택 종목의 레버리지 체결 내역을 불러오지 못했습니다.")
+            executions = spot_execution_events(market, fills, rows)
+
+    with chart_panel.container(border=True, width="stretch", key="market-chart-host"):
+        title = st.container()
+        interval_col, count_col, overlay_col = st.columns(3)
+        intervals = (0, 1, 3, 5, 10, 15, 30, 60, 240, 1440, 10080)
+        chart_minutes = interval_col.selectbox("차트 간격", intervals,
+                                               index=intervals.index(args.minutes),
+                                               format_func=lambda value: {0: "1초봉", 1440: "일봉", 10080: "주봉"}.get(value, f"{value}분"),
+                                               key=f"{path}:chart-interval")
+        count = count_col.selectbox("표시 봉 수", (30, 60, 100, 200), index=2,
+                                    key=f"{path}:chart-count")
+        indicators = overlay_col.multiselect("차트 지표", INDICATORS, default=[],
+                                              key=f"{path}:chart-indicators")
+        chart_key = (auto_path if mode == "자동매매" else path, mode, chart_minutes)
+        snapshot = st.session_state.get("market-chart-snapshot")
+        clock = monotonic()
+        if snapshot is None or snapshot["key"] != chart_key or clock - snapshot["sampled_at"] >= CHART_REFRESH_SECONDS:
+            chart_candles = market_candles
+            chart_boundary = boundary
+            try:
+                if chart_minutes == 0:
+                    chart_boundary = second_boundary
+                    chart_candles = second_candles or load_second_candles(market, chart_boundary)
+                elif chart_minutes != args.minutes:
+                    if chart_minutes == 10080:
+                        chart_boundary = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=now.weekday())
+                    else:
+                        interval = chart_minutes * 60
+                        seconds = int(now.timestamp())
+                        chart_boundary = datetime.fromtimestamp(seconds - seconds % interval, timezone.utc)
+                    chart_candles = load_market_candles(market, chart_minutes, chart_boundary)
+            except (URLError, TimeoutError, ValueError, KeyError, TypeError):
+                chart_candles = []
+            snapshot = {
+                "key": chart_key, "sampled_at": clock, "candles": chart_candles,
+                "latest": latest, "boundary": chart_boundary, "now": now, "executions": executions,
+                "average": average if mode == "수동매매" else None,
+            }
+            st.session_state["market-chart-snapshot"] = snapshot
+        with title:
+            show_market_heading(market, snapshot["latest"], quote)
+        show_price_chart(snapshot["candles"], snapshot["executions"], settings, quote, snapshot["boundary"],
+                         snapshot["now"], count, indicators, snapshot["average"],
+                         date_only=chart_minutes >= 1440, seconds=chart_minutes == 0)
+        base, symbol = market.split("-", maxsplit=1)
+        st.link_button("업비트에서 차트 보기", f"https://upbit.com/exchange?code=CRIX.UPBIT.{base}-{symbol}")
+
+    if guest:
+        with order_panel:
+            show_guest_actions()
+        return
+
+    if mode == "자동매매":
+        with chart_panel:
+            show_auto_history(auto_path, events, return_pct, executions)
+        return
+    if mode is None:
+        return
+
+    with workspace:
+        account_tab, execution_tab, performance_tab = st.tabs(("계좌 관리", "체결 내역", "수익률"))
+    with account_tab:
         if account["cash"] < 0:
-            st.warning("기존 롱 포지션과 손익을 반영한 가용 현금이 음수입니다. 가용 현금을 충전하세요.")
+            st.warning("기존 레버리지 포지션과 손익을 반영한 가용 현금이 음수입니다. 가용 현금을 충전하세요.")
 
         portfolio_cash = show_portfolio(base_account_path().parent, path, account, settings, rows, adjustments, wallet)
+        show_cash_and_accounts(path, settings, quote)
         average_price = f"{average:,.2f} {quote}" if average is not None else "—"
         st.caption(f"{market} 선택 계좌 · 가용 현금 {account['cash']:,.2f} {quote} · "
                    f"현물 {account['units']:,.8f} {asset} · 평균 매입가 {average_price}")
@@ -1123,65 +1576,16 @@ def render_account(path, *, guest):
                     with pnl_col:
                         signed_metric("예상 순손익", proceeds - cost, f"{proceeds - cost:+,.2f} {quote}")
 
-    with st.container(key="market-workspace"):
-        chart_panel, order_panel = st.columns([3, 1], gap="medium")
-    with chart_panel.container(border=True, width="stretch", key="market-chart-host"):
-        interval_col, count_col, overlay_col = st.columns(3)
-        intervals = (0, 1, 3, 5, 10, 15, 30, 60, 240, 1440, 10080)
-        chart_minutes = interval_col.selectbox("차트 간격", intervals,
-                                               index=intervals.index(args.minutes),
-                                               format_func=lambda value: {0: "1초봉", 1440: "일봉", 10080: "주봉"}.get(value, f"{value}분"),
-                                               key=f"{path}:chart-interval")
-        count = count_col.selectbox("표시 봉 수", (30, 60, 100, 200), index=2,
-                                    key=f"{path}:chart-count")
-        indicators = overlay_col.multiselect("차트 지표", INDICATORS, default=[],
-                                              key=f"{path}:chart-indicators")
-        if chart_minutes == 0:
-            chart_boundary = second_boundary
-        elif chart_minutes == 10080:
-            chart_boundary = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=now.weekday())
-        else:
-            interval = chart_minutes * 60
-            chart_boundary = datetime.fromtimestamp(seconds - seconds % interval, timezone.utc)
-        chart_candles = market_candles
-        if chart_minutes == 0:
-            chart_candles = second_candles
-        elif chart_minutes != args.minutes:
-            try:
-                chart_candles = load_market_candles(market, chart_minutes, chart_boundary)
-            except (URLError, TimeoutError, ValueError, KeyError, TypeError):
-                chart_candles = []
-        show_price_chart(chart_candles, fills, settings, quote, chart_boundary, now, count, indicators, average,
-                         date_only=chart_minutes >= 1440, seconds=chart_minutes == 0)
-        base, symbol = market.split("-", maxsplit=1)
-        st.link_button("업비트 원본 차트 열기", f"https://upbit.com/exchange?code=CRIX.UPBIT.{base}-{symbol}")
-
-    if guest:
-        with order_panel:
-            show_guest_actions()
-        show_strategy(settings, quote)
-        return
-
     with order_panel:
-        show_order_and_account(path, account, settings, args, live, quote, asset, orders, wallet, mark, portfolio_cash)
+        show_order_panel(path, account, settings, args, live, quote, asset, orders, wallet, mark, portfolio_cash)
 
-    try:
-        active_events = execution_events(path, market, fills, rows)
-    except sqlite3.Error:
-        st.warning("선택 종목의 레버리지 체결 내역을 불러오지 못했습니다.")
-        active_events = spot_execution_events(market, fills, rows)
-
-    chart, strategy = st.columns([2, 1])
-    with chart:
-        with st.container(border=True):
-            show_performance(candles, fills, rows, settings, quote, adjustments)
-        with st.container(border=True):
-            show_leverage_performance(market, active_events, wallet[4] if wallet is not None else None, quote)
-    with strategy.container(border=True):
-        show_strategy(settings, quote)
+    with performance_tab:
+        show_performance(candles, fills, rows, settings, quote, adjustments)
+        show_leverage_performance(market, executions, wallet[4] if wallet is not None else None, quote)
 
     if adjustments:
-        with st.expander("가용 현금 변경 내역"):
+        with account_tab, st.expander("가용 현금 변경 내역"):
+            net_funding = sum(event["amount"] for event in adjustments)
             st.caption("순조정 " + signed_text(net_funding, f"{net_funding:+,.2f} {quote}"), unsafe_allow_html=True)
             amount = f"변경액 ({quote})"
             history = pd.DataFrame([{
@@ -1190,12 +1594,16 @@ def render_account(path, *, guest):
             } for event in reversed(adjustments)])
             st.dataframe(history.style.map(signed_style, subset=[amount]), hide_index=True)
 
-    st.subheader("체결 내역")
+    with execution_tab:
+        show_manual_executions(path, executions)
+
+
+def show_manual_executions(path, active_events):
     executions, unavailable = session_execution_rows(base_account_path().parent, path, active_events)
     if unavailable:
         st.warning(f"일부 계좌의 체결 내역을 불러오지 못했습니다. · {unavailable:,}개")
     if not executions:
-        st.info("아직 체결 내역이 없습니다. 모의매매 조건이 충족되면 여기에 표시됩니다.")
+        st.info("아직 체결 내역이 없습니다. 모의 주문이 체결되면 이곳에서 확인할 수 있습니다.")
         return
 
     recent, history = st.tabs(["최근 체결", "전체 이력"])
@@ -1208,7 +1616,7 @@ def render_account(path, *, guest):
 
 def show_history(rows):
     side_col, start_col, end_col = st.columns(3)
-    side = side_col.selectbox("매매 구분", ("전체", *SIDE_LABELS.values(), *LONG_TRADE_LABELS), key="execution-history:side")
+    side = side_col.selectbox("매매 구분", ("전체", *SIDE_LABELS.values(), *LEVERAGE_TRADE_LABELS), key="execution-history:side")
     start = start_col.date_input("시작일", value=None, key="execution-history:start")
     end = end_col.date_input("종료일", value=None, key="execution-history:end")
     if start and end and start > end:
@@ -1265,23 +1673,27 @@ def select_account():
         except (sqlite3.Error, ValueError, TypeError) as error:
             st.session_state["market-error"] = f"모의계좌를 열 수 없습니다 · {error}"
     path = Path(st.session_state.get("paper-db", default_path))
-    if path.parent != default_path.parent or not path.is_file():
+    if path.parent != default_path.parent or path.name.startswith("paper-auto-") or not path.is_file():
         st.session_state.pop("paper-db", None)
         return default_path
     return path
 
 
 if __name__ == "__main__":
-    st.set_page_config(page_title="비트코인 모의매매 AI 에이전트", layout="wide")
+    st.set_page_config(page_title="코인 모의매매", layout="wide", initial_sidebar_state="auto")
+    if "dashboard-log-started" not in st.session_state:
+        operation_logger("dashboard").info("Dashboard session started")
+        st.session_state["dashboard-log-started"] = True
     title, theme = st.columns([4, 1], vertical_alignment="center")
     with title:
-        st.title("비트코인 모의매매 AI 에이전트", anchor=False)
-        st.caption("로그인 계정별 가상계좌")
+        st.title("코인 모의매매", anchor=False)
+        st.caption("업비트 원화 시세 · 가상 자금으로 거래")
     with theme:
         render_theme_picker(key="dashboard-theme")
     config = load_config()
     login = None
     if config is not None:
+        restore_browser_login()
         try:
             login = current_login(config)
         except SupabaseError:
@@ -1295,13 +1707,18 @@ if __name__ == "__main__":
         if page in ("login", "signup", "recover"):
             show_auth_page(config, page)
             st.stop()
-        if st.sidebar.button("로그인 / 회원가입"):
-            navigate("login")
         path = select_account()
     else:
-        show_account_controls(config, login)
+        with theme.popover("계정 메뉴", width="stretch"):
+            show_account_controls(config, login)
+        if page in ("account", "members") and not login["must_change_password"]:
+            if st.button("시세·매매로 돌아가기"):
+                navigate("market")
         if page == "account" or login["must_change_password"]:
             show_account_settings(config, login)
+            st.stop()
+        if page == "members":
+            show_member_management(config, login)
             st.stop()
         with show_storage_error(), account_changes(config):
             path = select_account()
@@ -1309,6 +1726,19 @@ if __name__ == "__main__":
     <style>
     .st-key-market-workspace { max-width: 1380px; margin-inline: auto; }
     .st-key-market-chart-host { min-width: 0; max-width: 100%; overflow-x: auto; }
+    .st-key-market-navigation [role="radiogroup"] label {
+        padding: 0.4rem 0.65rem;
+        border: 1px solid var(--st-border-color);
+        border-radius: var(--st-base-radius);
+    }
+    .st-key-market-navigation [role="radiogroup"] label:has(input:checked) {
+        border-color: var(--st-primary-color);
+        background: var(--st-secondary-background-color);
+    }
+    .st-key-market-navigation [role="radiogroup"] label:has(input:focus-visible) {
+        outline: 2px solid var(--st-primary-color);
+        outline-offset: 2px;
+    }
     </style>
     """)
     try:
@@ -1319,6 +1749,17 @@ if __name__ == "__main__":
         pass
     with st.sidebar:
         show_krw_market()
-    show_account(path, config, guest=login is None)
-    if login is None and st.session_state.pop("show-login-dialog", False):
-        login_dialog()
+    mode = None
+    with st.container(key="market-navigation"):
+        if login is not None:
+            modes = ("시세 보기", "수동매매", "자동매매")
+            remembered_mode = st.session_state.get("selected-market-mode", modes[0])
+            st.caption("**수동매매** · 종목과 주문 조건을 직접 정해 모의 주문을 넣습니다.  "
+                       "\n**자동매매** · 선택한 전략이 시세를 확인하고 조건에 맞으면 모의 주문을 실행합니다.")
+            selected_mode = st.radio("매매 방식", modes, index=modes.index(remembered_mode),
+                                     horizontal=True, key="market-mode", label_visibility="collapsed")
+            st.session_state["selected-market-mode"] = selected_mode
+            mode = None if selected_mode == "시세 보기" else selected_mode
+        elif st.button("로그인 / 회원가입", key="header-login"):
+            navigate("login")
+    show_account(path, config, guest=login is None, mode=mode)
